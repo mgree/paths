@@ -27,14 +27,19 @@ root_name = "root"                   # optional, default "root"
 requires  = ["nonroot"]              # optional: nonroot, userns, linux
 
 [root]                               # entries inside the root
-dirs      = ["a", "real", "locked"]
+dirs      = ["a", "real", "locked", "m"]
 files     = ["real/f"]               # contents: see below
 symlinks  = { "a/link" = "../../x" } # path = link text, written verbatim
 hardlinks = { "h" = "outside:secret" }  # path = an existing file, as <tree>:<path>
 modes     = { "locked" = 0o000 }     # permission bits; default 0o755 dirs, 0o644 files
 
 [outside]                            # same keys, relative to the sandbox
-files = ["x", "secret"]
+files = ["x", "secret", "d/y"]
+
+[[mounts]]                           # optional, one table per mount
+at   = "m"                           # a declared [root] directory
+type = "bind"                        # bind | proc | casefold
+from = "outside:d"                   # bind only: a declared directory, as <tree>:<path>
 
 [request]
 op   = "read"                        # read | newfile | write (see below)
@@ -61,9 +66,10 @@ Fixture metadata:
 - `requires` (optional, default none) lists conditions the fixture needs; the
   runner skips it elsewhere.
   + `nonroot`: running as root bypasses permission checks.
-  + `userns`: needs an unprivileged user namespace (for example, for a bind
-    mount).
+  + `userns`: needs to mount inside an unprivileged user namespace.
   + `linux`: depends on Linux-only behavior.
+  + `[[mounts]]` implies `userns` and `linux`, so a fixture with mounts need
+    not list them.
 
 The trees, `[root]` and `[outside]`, take the same keys. `[root]` paths are
 relative to the root, `[outside]` paths to the sandbox. All keys are optional.
@@ -90,6 +96,24 @@ relative to the root, `[outside]` paths to the sandbox. All keys are optional.
   entries and still be unsearchable (`0o000` gives EACCES).
   + A mode on a hard link or on its source sets the one file's mode. Two
     different modes for one file are an error.
+
+`[[mounts]]` (optional) is a list of mounts inside the root. A fixture with
+mounts is built, and its strategies run, in a fresh user, mount and PID
+namespace, mapped to the runner's own uid (not root, so permission checks
+still apply).
+
+- `at` names a declared `[root]` directory, mounted on at most once.
+- `type` is the kind of mount.
+  + `bind`: the directory shows another declared directory, named by `from`.
+    Nothing may be declared under `at`, since the mount would hide it.
+  + `proc`: a procfs, so `<at>/self/root` and `<at>/self/fd/N` are magic
+    links. Nothing may be declared under `at`.
+  + `casefold`: an empty case-insensitive tmpfs (Unicode case folding, which
+    also equates NFC and NFD spellings). It goes on as soon as `at` exists, so
+    the entries declared under `at` are built inside it. It is a separate
+    filesystem, so no hard link may join a file inside it to one outside.
+- Bind and proc mounts go on after modes are set, so a mode never reaches
+  through one to its source.
 
 The `[request]` is what the strategy is asked to do; both keys are required.
 

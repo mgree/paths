@@ -1,0 +1,16 @@
+hazard = "Case and Unicode folding"
+about = """Control: the filesystem decides whether two names match. This directory is \
+case-sensitive, so foo does not exist, and a strategy that folds case itself must not \
+open Foo."""
+requires = ["linux"]
+
+[root]
+files = ["Foo"]
+
+[request]
+op = "read"
+path = "foo"
+
+[expect]
+result = "error"
+errno = "ENOENT"

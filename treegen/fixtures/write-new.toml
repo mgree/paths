@@ -1,5 +1,5 @@
 hazard = "Dangling symlinks"
-about = "Control: write creates a new file inside the root."
+about = "Control: as newfile-inside, for write."
 
 [root]
 dirs = ["a"]

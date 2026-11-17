@@ -1,5 +1,6 @@
 hazard = "Missing tail"
-about = "missing/../x collapses lexically to x, but the kernel refuses it."
+about = """Lexical cleaning changes what a path means: the kernel needs missing to exist before \
+.. can leave it, so missing/../x names nothing, while a lexical strategy (S1) opens x."""
 
 [root]
 files = ["x"]

@@ -1,5 +1,7 @@
 hazard = "Dangling symlinks"
-about = "write through a dangling relative symlink that climbs out: beneath refuses; in-root clamps .. at the root and creates the file inside."
+about = """write creates whatever a dangling final symlink names. This one climbs out of the \
+root, so its target must not be created outside: beneath refuses, and in-root clamps \
+the .. at the root and creates the file inside."""
 
 [root]
 symlinks = { "new" = "../created" }

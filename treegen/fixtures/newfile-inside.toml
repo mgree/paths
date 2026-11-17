@@ -1,5 +1,6 @@
 hazard = "Dangling symlinks"
-about = "Control: newfile creates a new file inside the root."
+about = """Control: creating a file is ordinary. A strategy that requires the last component to \
+exist (as realpath does) cannot create anything."""
 
 [root]
 dirs = ["a"]

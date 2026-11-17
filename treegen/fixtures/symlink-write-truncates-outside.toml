@@ -1,5 +1,6 @@
 hazard = "Symlink escape"
-about = "write through a final-component symlink to an outside file must not truncate it (the classic /tmp symlink attack)."
+about = """write follows a final symlink, so a planted link turns an ordinary write into \
+truncating a file outside the root (the classic /tmp attack)."""
 
 [root]
 symlinks = { "link" = "{sandbox}/secret" }

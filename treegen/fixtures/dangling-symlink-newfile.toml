@@ -1,5 +1,7 @@
 hazard = "Dangling symlinks"
-about = "newfile (O_EXCL) through a dangling symlink fails with EEXIST and creates nothing; O_EXCL is the mitigation, so even naive strategies pass."
+about = """O_EXCL never follows a final symlink, so newfile through a dangling one fails with \
+EEXIST and creates nothing, even in a naive strategy. A strategy that emulates newfile \
+by following the link and then creating loses that guarantee."""
 
 [root]
 symlinks = { "new" = "{sandbox}/created" }

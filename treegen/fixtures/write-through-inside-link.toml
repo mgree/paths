@@ -1,5 +1,7 @@
 hazard = "Symlink escape"
-about = "Control: write through a relative symlink that stays inside the root truncates its target."
+about = """A write through a link that stays inside the root must, if it succeeds, truncate the \
+link's target. Refusing every final symlink on write (O_NOFOLLOW, common hardening) is \
+also accepted: whether to follow is a policy question."""
 
 [root]
 files = ["real/f"]
@@ -10,5 +12,4 @@ op = "write"
 path = "link"
 
 [expect]
-result = "ok"
-file = "real/f"
+accept = [{ result = "ok", file = "real/f" }, { result = "refused" }]

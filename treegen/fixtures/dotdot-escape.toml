@@ -1,5 +1,6 @@
 hazard = ".. escape"
-about = "Plain .. components that climb above the root."
+about = """The simplest escape, with no links at all: .. climbs above the root. Any strategy that \
+checks paths must refuse it."""
 
 [root]
 dirs = ["a"]

@@ -1,0 +1,16 @@
+hazard = "Case and Unicode folding"
+about = """Control: the filesystem decides whether two names match. On an ordinary Linux \
+directory names are bytes, so the NFD spelling of e-acute does not name the NFC file, \
+and a strategy that normalizes names itself must not open it."""
+requires = ["linux"]
+
+[root]
+files = ["\u00e9"]
+
+[request]
+op = "read"
+path = "e\u0301"
+
+[expect]
+result = "error"
+errno = "ENOENT"

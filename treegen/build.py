@@ -1,7 +1,9 @@
-"""Build trees on disk, scan them back, and render canonical listings.
+"""Build fixtures on disk and scan them back.
 
 All filesystem work goes through directory descriptors, one component at a
-time, so trees deeper than PATH_MAX build and scan like any other.
+time, so trees deeper than PATH_MAX build and scan like any other. Fixtures
+with mounts exist only inside the namespace they were built in, so build and
+use them inside ns.run_in_namespace.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import ns
 from .spec import Entry, Fixture, Tree, split_ref
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -27,14 +30,6 @@ def expand(text: str, root: Path, sandbox: Path) -> str:
     return text.replace("{root}", str(root)).replace("{sandbox}", str(sandbox))
 
 
-def unexpand(text: str, root: Path, sandbox: Path) -> str:
-    """Put the placeholders back; the root, being longer, wins over the sandbox."""
-    for real, ph in ((str(root), "{root}"), (str(sandbox), "{sandbox}")):
-        if text == real or text.startswith(real + "/"):
-            return ph + text[len(real) :]
-    return text
-
-
 class Sandbox:
     """A fresh directory holding <root_name>/ and the outside entries."""
 
@@ -42,10 +37,14 @@ class Sandbox:
         self.path = Path(tempfile.mkdtemp(prefix="pt-", dir=base)).resolve()
         self.root_name = root_name
         self.root = self.path / root_name
+        self.mounts: dict[str, str] = {}  # root-relative mount point -> type, in mount order
         os.mkdir(self.root, 0o755)
         os.chmod(self.root, 0o755)
 
     def remove(self) -> None:
+        for at in reversed(list(self.mounts)):  # unmount first: never delete through one
+            ns.umount(self.root / at)
+        self.mounts.clear()
         _make_traversable(self.path)
         shutil.rmtree(self.path)
 
@@ -83,14 +82,13 @@ def open_dir(base_fd: int, rel: str) -> Generator[int]:
         os.close(fd)
 
 
-def _unlock(stack: ExitStack, dir_fd: int, name: str, need: int, grant: int) -> int:
+def _unlock(stack: ExitStack, dir_fd: int, name: str, need: int, grant: int) -> None:
     """If name lacks the owner bits in need, add grant, and have stack restore
-    the old mode on exit. Returns the old mode."""
+    the old mode on exit."""
     mode = stat.S_IMODE(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
     if mode & need != need:
         os.chmod(name, mode | grant, dir_fd=dir_fd)
         stack.callback(os.chmod, name, mode, dir_fd=dir_fd)
-    return mode
 
 
 def _make_traversable(top: Path) -> None:
@@ -113,21 +111,26 @@ def _split(path: str) -> tuple[str, str]:
     return head, name
 
 
-def file_contents(fixture: str, tree: str, path: str) -> bytes:
+def _file_contents(fixture: str, tree: str, path: str) -> bytes:
     """One line, unique across the suite: '<fixture> <tree>:<path>'."""
     return f"{fixture} {tree}:{path}\n".encode()
 
 
-def build_trees(fds: dict[str, int], fx: Fixture, sb: Sandbox) -> None:
+def _build_trees(fds: dict[str, int], fx: Fixture, sb: Sandbox) -> None:
     """Create both trees in phases, one kind of entry at a time across both:
     every directory and file exists before any hard link names it as a source,
-    whichever tree it is in. fds maps "root" and "outside" to their bases."""
+    whichever tree it is in. A casefold mount goes on its directory as soon as
+    the directory exists, so everything under it is built inside the mount.
+    fds maps "root" and "outside" to their bases."""
+    casefold = {m.at for m in fx.mounts if m.type == "casefold"}
     trees = (("outside", fx.outside), ("root", fx.root))
     for kind in ("dir", "file", "hardlink", "symlink"):
         for label, tree in trees:
             for e in tree.sorted():  # parents sort before children
                 if e.kind == kind:
                     _create(fds, label, e, fx.name, sb)
+                    if label == "root" and e.path in casefold:
+                        _mount_casefold(fds["root"], e.path, sb)
 
 
 def _create(fds: dict[str, int], label: str, e: Entry, fixture: str, sb: Sandbox) -> None:
@@ -137,7 +140,7 @@ def _create(fds: dict[str, int], label: str, e: Entry, fixture: str, sb: Sandbox
             os.mkdir(name, 0o700, dir_fd=fd)
         elif e.kind == "file":
             with opened(name, NEW_FILE_FLAGS, 0o600, dir_fd=fd) as ffd:
-                os.write(ffd, file_contents(fixture, label, e.path))
+                os.write(ffd, _file_contents(fixture, label, e.path))
         elif e.kind == "hardlink":
             src_tree, src = split_ref(e.link)
             src_head, src_name = _split(src)
@@ -147,7 +150,29 @@ def _create(fds: dict[str, int], label: str, e: Entry, fixture: str, sb: Sandbox
             os.symlink(expand(e.link, sb.root, sb.path), name, dir_fd=fd)
 
 
-def apply_modes(base_fd: int, tree: Tree) -> None:
+def _mount_casefold(root_fd: int, at: str, sb: Sandbox) -> None:
+    ns.mount("tmpfs", sb.root / at, "tmpfs", 0, ns.CASEFOLD_OPTIONS)
+    sb.mounts[at] = "casefold"
+    with open_dir(root_fd, at) as fd:  # opened after mounting: the tmpfs's top
+        ns.set_casefold(fd)
+
+
+def _mount_late(fx: Fixture, sb: Sandbox) -> None:
+    """Bind and proc mounts go on after modes, so chmod never reaches through
+    one to its source."""
+    for m in fx.mounts:
+        target = sb.root / m.at
+        if m.type == "bind":
+            assert m.source is not None
+            tree, path = m.source
+            ns.mount((sb.root if tree == "root" else sb.path) / path, target, None, ns.MS_BIND)
+        elif m.type == "proc":
+            ns.mount("proc", target, "proc")
+        if m.type != "casefold":  # casefold went on during the build
+            sb.mounts[m.at] = m.type
+
+
+def _apply_modes(base_fd: int, tree: Tree) -> None:
     """chmod every non-symlink entry, deepest first, so a 000 directory is last."""
     for e in sorted(tree.entries.values(), key=lambda e: -e.path.count("/")):
         mode = e.effective_mode()
@@ -164,100 +189,40 @@ def build_fixture(fx: Fixture, base: str | Path | None = None) -> Sandbox:
     with ExitStack() as stack:
         sb = stack.enter_context(Sandbox(base, fx.root_name))
         with opened(sb.path, DIR_FLAGS) as top, opened(sb.root, DIR_FLAGS) as root:
-            build_trees({"outside": top, "root": root}, fx, sb)
-            apply_modes(top, fx.outside)
-            apply_modes(root, fx.root)
+            _build_trees({"outside": top, "root": root}, fx, sb)
+            _apply_modes(top, fx.outside)
+            _apply_modes(root, fx.root)
+        _mount_late(fx, sb)
         stack.pop_all()  # success: keep the sandbox, now the caller's
         return sb
 
 
-# --- listings -------------------------------------------------------------
+# --- reading back ---------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Record:
+    """One entry as found on disk."""
+
     tree: str  # "outside" or "root"
     path: str
-    kind: str  # dir, file, symlink, hardlink
-    mode: int | None
-    target: str | None  # symlink text (placeholder form) or hard-link source (<tree>:<path>)
-
-    def line(self) -> str:
-        k = {"dir": "d", "file": "f", "symlink": "l", "hardlink": "h"}[self.kind]
-        m = "----" if self.mode is None else f"{self.mode:04o}"
-        s = f"{self.tree:<7} {k} {m}  {self.path}"
-        if self.kind == "symlink":
-            s += f" -> {self.target}"
-        elif self.kind == "hardlink":
-            s += f" == {self.target}"
-        return s
-
-
-def _ref(tree: str, path: str) -> str:
-    return f"{tree}:{path}"
-
-
-def _canonical_hardlinks(
-    records: list[Record], groups: list[list[tuple[str, str]]]
-) -> list[Record]:
-    """Within each group of names for one inode, the first in order is the file."""
-    by_key = {(r.tree, r.path): r for r in records}
-    for group in groups:
-        group = sorted(group)
-        first = by_key[group[0]]
-        mode = next((by_key[k].mode for k in group if by_key[k].kind == "file"), first.mode)
-        by_key[group[0]] = Record(first.tree, first.path, "file", mode, None)
-        for k in group[1:]:
-            by_key[k] = Record(k[0], k[1], "hardlink", mode, _ref(*group[0]))
-    return [by_key[k] for k in sorted(by_key)]
-
-
-def predict(fx: Fixture) -> list[Record]:
-    """The listing a correct build of fx produces, computed from the spec alone."""
-    # Placeholders round-trip through made-up paths, as scan's do through real
-    # ones, so text such as {sandbox}/root/x predicts scan's {root}/x.
-    sandbox = Path("/nonexistent-sandbox")
-    root = sandbox / fx.root_name
-    records, links = [], []
-    for label, tree in (("outside", fx.outside), ("root", fx.root)):
-        for e in tree.sorted():
-            target = e.target
-            if e.kind == "symlink":
-                target = unexpand(expand(e.link, root, sandbox), root, sandbox)
-            if e.kind == "hardlink":
-                links.append(((label, e.path), split_ref(e.link)))
-            records.append(Record(label, e.path, e.kind, e.effective_mode(), target))
-    groups = _union(links)
-    return _canonical_hardlinks(records, groups)
-
-
-def _union(pairs: list[tuple[tuple, tuple]]) -> list[list[tuple]]:
-    parent: dict = {}
-
-    def find(x):
-        while parent.setdefault(x, x) != x:
-            x = parent[x]
-        return x
-
-    for a, b in pairs:
-        parent[find(a)] = find(b)
-    groups: dict = {}
-    for x in list(parent):
-        groups.setdefault(find(x), []).append(x)
-    return list(groups.values())
+    kind: str  # dir, file, symlink, or bind / proc (a mount point, not descended into)
+    mode: int | None  # None for symlinks
+    target: str | None  # symlink text as on disk
+    ino: tuple[int, int]  # (st_dev, st_ino); hard links share it
 
 
 def scan(sb: Sandbox) -> list[Record]:
-    """Read the sandbox back from disk as a listing."""
+    """Every entry in the sandbox, sorted by (tree, path). Descends into
+    casefold mounts (the fixture's own entries are there) but not into bind or
+    proc mounts, whose contents are another directory's or the kernel's."""
     records: list[Record] = []
-    inodes: dict[tuple[int, int], list[tuple[str, str]]] = {}
     with opened(sb.path, DIR_FLAGS) as top:
-        _scan_dir(top, "", sb, records, inodes)
-    groups = [g for g in inodes.values() if len(g) > 1]
-    return _canonical_hardlinks(records, groups)
+        _scan_dir(top, "", sb, records)
+    return sorted(records, key=lambda r: (r.tree, r.path))
 
 
-def _scan_dir(fd, prefix, sb, records, inodes) -> None:
+def _scan_dir(fd: int, prefix: str, sb: Sandbox, records: list[Record]) -> None:
     for name in sorted(os.listdir(fd)):
         rel = f"{prefix}{name}"
         st = os.stat(name, dir_fd=fd, follow_symlinks=False)
@@ -265,39 +230,39 @@ def _scan_dir(fd, prefix, sb, records, inodes) -> None:
             tree, path = "root", rel[len(sb.root_name) + 1 :]
         else:
             tree, path = "outside", rel
-        mode = stat.S_IMODE(st.st_mode)
+        mode, ino = stat.S_IMODE(st.st_mode), (st.st_dev, st.st_ino)
+        mount = sb.mounts.get(path) if tree == "root" else None
         if stat.S_ISLNK(st.st_mode):
-            text = os.readlink(name, dir_fd=fd)
-            records.append(Record(tree, path, "symlink", None, unexpand(text, sb.root, sb.path)))
+            records.append(Record(tree, path, "symlink", None, os.readlink(name, dir_fd=fd), ino))
         elif stat.S_ISREG(st.st_mode):
-            records.append(Record(tree, path, "file", mode, None))
-            inodes.setdefault((st.st_dev, st.st_ino), []).append((tree, path))
+            records.append(Record(tree, path, "file", mode, None, ino))
+        elif mount in ("bind", "proc"):
+            records.append(Record(tree, path, mount, mode, None, ino))
         elif stat.S_ISDIR(st.st_mode):
             if path:  # the root directory itself is not an entry
-                records.append(Record(tree, path, "dir", mode, None))
+                records.append(Record(tree, path, "dir", mode, None, ino))
             with ExitStack() as stack:
                 _unlock(stack, fd, name, 0o500, 0o700)
                 child = stack.enter_context(opened(name, DIR_FLAGS, dir_fd=fd))
-                _scan_dir(child, rel + "/", sb, records, inodes)
+                _scan_dir(child, rel + "/", sb, records)
         else:
             raise ValueError(f"unexpected file type at {rel!r}: {st.st_mode:o}")
 
 
 def snapshot_outside(sb: Sandbox) -> dict[str, tuple]:
     """Everything outside the root that a strategy could change: per entry its
-    kind, mode, link text and, for files, contents. Compare before and after."""
+    kind, mode, link text, identity and, for files, contents. Compare before
+    and after."""
     snap: dict[str, tuple] = {}
     for r in scan(sb):
         if r.tree != "outside":
             continue
-        data = None
-        if r.kind in ("file", "hardlink"):
-            data = _read_unlocked(sb.path, r.path)
-        snap[r.path] = (r.kind, r.mode, r.target, data)
+        data = read_unlocked(sb.path, r.path) if r.kind == "file" else None
+        snap[r.path] = (r.kind, r.mode, r.target, r.ino, data)
     return snap
 
 
-def _read_unlocked(top: Path, rel: str) -> bytes:
+def read_unlocked(top: Path, rel: str) -> bytes:
     """Read a file even under mode-000 directories, restoring their modes."""
     head, name = _split(rel)
     with ExitStack() as stack:  # unwinds innermost first: close, then restore
@@ -308,7 +273,3 @@ def _read_unlocked(top: Path, rel: str) -> bytes:
         _unlock(stack, fd, name, 0o400, 0o400)
         with opened(name, READ_FLAGS, dir_fd=fd) as ffd:
             return b"".join(iter(lambda: os.read(ffd, 1 << 16), b""))
-
-
-def listing(records: list[Record]) -> str:
-    return "".join(r.line() + "\n" for r in records)

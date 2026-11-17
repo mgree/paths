@@ -1,0 +1,23 @@
+hazard = "Mount points"
+about = """A directory inside the root is a bind mount of one outside it. Lookup follows \
+mounts, so scoped lookup opens the outside file as if it were inside; RESOLVE_NO_XDEV \
+refuses it. Both are accepted, since only a privileged user can create the mount \
+(and so it is 'safe' by fiat). Whether or not to follow is a policy question."""
+
+[root]
+dirs = ["m"]
+
+[outside]
+files = ["d/secret"]
+
+[[mounts]]
+at = "m"
+type = "bind"
+from = "outside:d"
+
+[request]
+op = "read"
+path = "m/secret"
+
+[expect]
+accept = [{ result = "ok", file = "m/secret" }, { result = "refused" }]

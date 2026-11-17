@@ -22,6 +22,11 @@ REQUIRES = ("nonroot", "userns", "linux")
 # shell ">" do: creates or truncates, and follows a final symlink.
 OPS = ("read", "newfile", "write")
 RESULTS = ("ok", "refused", "error")
+# bind: another declared directory's contents; proc: a procfs; casefold: an
+# empty case-insensitive tmpfs that the fixture's entries are built inside.
+MOUNT_TYPES = ("bind", "proc", "casefold")
+# What [[mounts]] implies: we can only mount unprivileged in a Linux user namespace.
+MOUNT_REQUIRES = ("userns", "linux")
 
 
 class SpecError(ValueError):
@@ -100,6 +105,13 @@ class Expect:
     errno: str | None = None
 
 
+@dataclass(frozen=True)
+class Mount:
+    at: str  # a declared [root] directory
+    type: str  # one of MOUNT_TYPES
+    source: tuple[str, str] | None = None  # bind only: (tree, path) of a declared directory
+
+
 @dataclass
 class Fixture:
     name: str
@@ -113,6 +125,7 @@ class Fixture:
     expect: tuple[Expect, ...]  # accepted outcomes, RESOLVE_BENEATH-style strategies
     expect_in_root: tuple[Expect, ...]  # accepted outcomes, RESOLVE_IN_ROOT-style
     outside_changes: tuple[str, ...] = ()  # [outside] files allowed to change; default none
+    mounts: tuple[Mount, ...] = ()  # in declaration order
 
 
 def check_entry_path(path: str) -> None:
@@ -234,6 +247,68 @@ def _check_hardlinks(root: Tree, outside: Tree, source: str) -> None:
                 trees[t].set_mode(p, mode)
 
 
+def parse_mounts(items, root: Tree, outside: Tree, source: str) -> tuple[Mount, ...]:
+    """The [[mounts]] list, checked against the trees it mounts on and from."""
+    if not isinstance(items, list) or not all(isinstance(m, dict) for m in items):
+        raise SpecError(f"{source}: mounts must be a list of tables ([[mounts]])")
+    trees = {"root": root, "outside": outside}
+    out: list[Mount] = []
+    for i, m in enumerate(items):
+        where = f"{source}: mounts[{i}]"
+        _keys(m, {"at", "type", "from"}, where)
+        at, kind = m.get("at"), m.get("type")
+        if kind not in MOUNT_TYPES:
+            raise SpecError(f"{where}: type must be one of {MOUNT_TYPES}")
+        entry = root.entries.get(at) if isinstance(at, str) else None
+        if entry is None or entry.kind != "dir":
+            if not isinstance(at, str):
+                why = "missing" if at is None else f"not a string: {at!r}"
+            elif entry is not None:
+                why = f"{at!r} is a {entry.kind} in [root]"
+            elif at in outside.entries:
+                why = f"{at!r} is an [outside] entry"
+            else:
+                why = f"{at!r} is not declared"
+            raise SpecError(f"{where}: at must name a declared [root] directory; {why}")
+        if any(x.at == at for x in out):
+            raise SpecError(f"{where}: {at!r} is mounted twice")
+        if kind != "casefold" and any(p.startswith(at + "/") for p in root.entries):
+            raise SpecError(f"{where}: entries under {at!r} would be hidden by the mount")
+        src = None
+        if kind == "bind":
+            if not isinstance(m.get("from"), str):
+                raise SpecError(f"{where}: a bind mount needs from = <tree>:<path>")
+            src = split_ref(m["from"])
+            src_entry = trees[src[0]].entries.get(src[1])
+            if src_entry is None or src_entry.kind != "dir":
+                raise SpecError(f"{where}: from {m['from']!r} is not a declared directory")
+        elif "from" in m:
+            raise SpecError(f"{where}: only bind mounts take from")
+        out.append(Mount(at, kind, src))
+    _check_links_stay_on_one_filesystem(out, root, outside, source)
+    return tuple(out)
+
+
+def _check_links_stay_on_one_filesystem(
+    mounts: list[Mount], root: Tree, outside: Tree, source: str
+) -> None:
+    """A casefold mount is its own filesystem, and a hard link cannot cross one."""
+    casefold = [m.at for m in mounts if m.type == "casefold"]
+
+    def fs(tree: str, path: str) -> str | None:
+        if tree != "root":
+            return None
+        return next((at for at in casefold if path == at or path.startswith(at + "/")), None)
+
+    for label, tree in (("root", root), ("outside", outside)):
+        for e in tree.entries.values():
+            if e.kind == "hardlink" and fs(label, e.path) != fs(*split_ref(e.link)):
+                raise SpecError(
+                    f"{source}: hard link {label}:{e.path} and its source {e.link!r} are on "
+                    "different filesystems (a casefold mount lies between them)"
+                )
+
+
 def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
     """name is the fixture's identifier: its file name without .toml."""
     _keys(
@@ -247,6 +322,7 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
             "outside",
             "request",
             "expect",
+            "mounts",
         },
         source,
     )
@@ -266,6 +342,9 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
     if root_name in outside.entries or any(p.startswith(root_name + "/") for p in outside.entries):
         raise SpecError(f"{source}: [outside] collides with root_name {root_name!r}")
     _check_hardlinks(root, outside, source)
+    mounts = parse_mounts(data.get("mounts", []), root, outside, source)
+    if mounts:
+        requires += tuple(r for r in MOUNT_REQUIRES if r not in requires)
     req = data.get("request")
     if not isinstance(req, dict):
         raise SpecError(f"{source}: [request] is required")
@@ -299,6 +378,7 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
         expect=base,
         expect_in_root=in_root,
         outside_changes=changes,
+        mounts=mounts,
     )
 
 

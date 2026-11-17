@@ -1,5 +1,7 @@
 hazard = "Hard links"
-about = "A hard link inside the root to a file outside. Containment cannot see it; only an st_nlink policy can."
+about = """A hard link is the outside file itself, so no path check can tell it from a file \
+inside, and reading it is expected. The st_nlink policy that refuses linked files \
+exists for privileged writes (hard-link-out-write), not reads."""
 
 [root]
 hardlinks = { "h" = "outside:secret" }

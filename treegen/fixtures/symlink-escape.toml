@@ -1,5 +1,6 @@
 hazard = "Symlink escape"
-about = "An absolute symlink inside the root points at a directory outside it."
+about = """The plain symlink escape: an absolute link inside the root names a directory outside \
+it."""
 
 [root]
 symlinks = { "link" = "{sandbox}/secret" }

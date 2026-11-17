@@ -1,0 +1,22 @@
+hazard = "Magic links"
+about = """With /proc mounted inside a container's root, proc/self/root is a magic link to the \
+host's root, so a relative symlink escapes without any absolute link text. Correct \
+strategies refuse magic links, or read them as links and re-anchor them at the root."""
+
+[root]
+dirs = ["proc"]
+symlinks = { "l" = "proc/self/root{sandbox}/secret" }
+
+[outside]
+files = ["secret"]
+
+[[mounts]]
+at = "proc"
+type = "proc"
+
+[request]
+op = "read"
+path = "l"
+
+[expect]
+result = "refused"

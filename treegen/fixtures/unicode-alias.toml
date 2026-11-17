@@ -1,0 +1,19 @@
+hazard = "Case and Unicode folding"
+about = """Control: the filesystem decides whether two names match. A casefold directory also \
+folds normalization, so the NFD spelling of e-acute (e plus a combining accent) names \
+the file stored as NFC (one code point)."""
+
+[root]
+files = ["ci/\u00e9"]
+
+[[mounts]]
+at = "ci"
+type = "casefold"
+
+[request]
+op = "read"
+path = "ci/e\u0301"
+
+[expect]
+result = "ok"
+file = "ci/\u00e9"

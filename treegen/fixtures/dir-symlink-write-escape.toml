@@ -1,5 +1,7 @@
 hazard = "Symlink escape"
-about = "write through a directory symlink that climbs out must not create or truncate anything outside the root."
+about = """The escaping symlink is a middle component, not the last, so O_NOFOLLOW (which guards \
+only the last) does not stop this write from creating or truncating a file outside the \
+root."""
 
 [root]
 symlinks = { "d" = "../outside-dir" }

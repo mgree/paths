@@ -1,5 +1,8 @@
 hazard = "Hard links"
-about = "write through a hard link to an outside file truncates that file: containment cannot see hard links. Only an st_nlink policy refuses it."
+about = """A hard link is the outside file itself, so no path check can see that writing h \
+truncates a file outside the root. Both are accepted: refusing needs an st_nlink \
+policy (refuse files with other names), which privileged writers such as Postfix's \
+local delivery apply."""
 
 [root]
 hardlinks = { "h" = "outside:secret" }

@@ -1,7 +1,7 @@
 hazard = "Symlink escape"
-about = """An absolute symlink spelling the root's host path. No scoped lookup can \
-follow it; resolve-then-check (S2) opens it. Opening is accepted, but it leaks: \
-whoever can plant symlinks in the root can probe for the root's host path."""
+about = """An absolute link that spells the root's own host path stays inside, but only a \
+resolve-then-check strategy (S2) can follow it. Both are accepted; opening leaks the \
+root's host location to whoever can plant links."""
 
 [root]
 files = ["real/f"]

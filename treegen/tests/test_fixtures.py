@@ -6,8 +6,18 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from treegen.build import build_fixture, listing, predict, scan, snapshot_outside
-from treegen.spec import FIXTURE_DIR, SpecError, all_fixtures, parse_fixture
+from treegen import ns
+from treegen.build import (
+    DIR_FLAGS,
+    Sandbox,
+    build_fixture,
+    expand,
+    opened,
+    read_unlocked,
+    scan,
+    snapshot_outside,
+)
+from treegen.spec import FIXTURE_DIR, Fixture, SpecError, all_fixtures, parse_fixture, split_ref
 
 FIXTURES = all_fixtures()
 IDS = [f.name for f in FIXTURES]
@@ -17,16 +27,73 @@ REPO = Path(__file__).resolve().parents[2]
 BASES = {"tmpfs": Path("/dev/shm"), "repo-fs": REPO / "build" / "sandboxes"}
 
 
+def check_build(fx: Fixture, sb: Sandbox) -> None:
+    """The sandbox holds exactly the declared entries, each as declared: kind,
+    mode, symlink text, hard links as one file, mounts really mounted."""
+    got = {(r.tree, r.path): r for r in scan(sb)}
+    declared = {("root", p): e for p, e in fx.root.entries.items()}
+    declared |= {("outside", p): e for p, e in fx.outside.entries.items()}
+    assert sorted(got) == sorted(declared), "missing or undeclared entries"
+    mounts = {m.at: m for m in fx.mounts}
+    top_dev = os.stat(sb.path).st_dev
+    files: dict[tuple[str, str], tuple[int, int]] = {}  # each file's first name -> inode
+    for key, e in declared.items():
+        r = got[key]
+        m = mounts.get(e.path) if key[0] == "root" else None
+        if m is not None and m.type != "casefold":
+            assert r.kind == m.type, key
+            if m.source is not None:  # bind: the mount point shows the source itself
+                assert r.ino == got[m.source].ino, f"{key} is not a mount of {m.source}"
+            else:
+                assert r.ino[0] != top_dev, f"{key} is not a mount"
+            continue
+        assert r.kind == ("file" if e.kind == "hardlink" else e.kind), key
+        assert r.mode == e.effective_mode(), key
+        if m is not None:  # casefold: its own filesystem, case-insensitive at the top
+            assert r.ino[0] != top_dev, f"{key} is not a mount"
+            with opened(sb.root / e.path, DIR_FLAGS) as fd:
+                assert ns.is_casefold(fd), f"{key} is not case-insensitive"
+        if e.kind == "symlink":
+            assert r.target == expand(e.link, sb.root, sb.path), key
+        if e.kind in ("file", "hardlink"):
+            name = split_ref(e.link) if e.kind == "hardlink" else key
+            assert files.setdefault(name, r.ino) == r.ino, f"{key} is not one file with {name}"
+    assert len(set(files.values())) == len(files), "two declared files share an inode"
+
+
+def in_sandbox(fx: Fixture, base: Path, fn):
+    """Build fx and return fn(fx, sb), inside a namespace if fx has mounts."""
+
+    def go():
+        with build_fixture(fx, base) as sb:
+            return fn(fx, sb)
+
+    if not fx.mounts:
+        return go()
+    if not ns.mounts_available():
+        pytest.skip(ns.why_no_mounts() or "")
+    return ns.run_in_namespace(go)
+
+
 def test_fixture_dir_nonempty():
     assert len(FIXTURES) == len(list(FIXTURE_DIR.glob("*.toml"))) > 0
 
 
 @pytest.mark.parametrize("base", BASES.values(), ids=BASES.keys())
 @pytest.mark.parametrize("fx", FIXTURES, ids=IDS)
-def test_build_matches_prediction(fx, base):
+def test_build_matches_spec(fx, base):
     base.mkdir(parents=True, exist_ok=True)
-    with build_fixture(fx, base) as sb:
-        assert listing(scan(sb)) == listing(predict(fx))
+    in_sandbox(fx, base, check_build)
+
+
+def declared_file(fx: Fixture, path: str):
+    """The declared entry a root-relative path names, looking through bind mounts."""
+    for m in fx.mounts:
+        if m.source is not None and path.startswith(m.at + "/"):
+            tree, src = m.source
+            rest = path[len(m.at) + 1 :]
+            return (fx.root if tree == "root" else fx.outside).entries.get(f"{src}/{rest}")
+    return fx.root.entries.get(path)
 
 
 @pytest.mark.parametrize("fx", FIXTURES, ids=IDS)
@@ -34,7 +101,8 @@ def test_expectations_name_real_entries(fx):
     for e in fx.expect + fx.expect_in_root:
         if e.result != "ok":
             continue
-        entry = fx.root.entries.get(e.file)
+        assert e.file is not None
+        entry = declared_file(fx, e.file)
         if fx.request.op == "read":
             assert entry is not None and entry.kind in ("file", "hardlink"), e.file
         elif fx.request.op == "newfile":
@@ -60,6 +128,9 @@ MINIMAL = {
     "request": {"op": "read", "path": "x"},
     "expect": {"result": "refused"},
 }
+
+
+NS = {"root": {"dirs": ["p"]}}
 
 
 @pytest.mark.parametrize(
@@ -104,6 +175,36 @@ MINIMAL = {
         ({"expect": {"result": "refused", "accept": []}}, "cannot be mixed"),
         ({"root_name": "a/b"}, "one component"),
         ({"root_name": "r", "outside": {"files": ["r/x"]}}, "collides"),
+        ({**NS, "mounts": {"at": "p", "type": "proc"}}, "list of tables"),
+        ({**NS, "mounts": [{"at": "p", "type": "nfs"}]}, "type must be one of"),
+        ({**NS, "mounts": [{"at": "nothere", "type": "proc"}]}, "'nothere' is not declared"),
+        ({**NS, "mounts": [{"type": "proc"}]}, "directory; missing"),
+        (
+            {"root": {"files": ["f"]}, "mounts": [{"at": "f", "type": "proc"}]},
+            "'f' is a file in \\[root\\]",
+        ),
+        (
+            {"outside": {"dirs": ["d"]}, "mounts": [{"at": "d", "type": "proc"}]},
+            "'d' is an \\[outside\\] entry",
+        ),
+        ({**NS, "mounts": [{"at": "p", "type": "proc"}] * 2}, "mounted twice"),
+        (
+            {**NS, "root": {"files": ["p/x"]}, "mounts": [{"at": "p", "type": "proc"}]},
+            "hidden by the mount",
+        ),
+        ({**NS, "mounts": [{"at": "p", "type": "bind"}]}, "needs from"),
+        (
+            {**NS, "mounts": [{"at": "p", "type": "bind", "from": "outside:no"}]},
+            "'outside:no' is not a declared directory",
+        ),
+        (
+            {
+                "root": {"files": ["ci/f"], "hardlinks": {"h": "root:ci/f"}},
+                "mounts": [{"at": "ci", "type": "casefold"}],
+            },
+            "different filesystems",
+        ),
+        ({**NS, "mounts": [{"at": "p", "type": "proc", "from": "root:p"}]}, "only bind"),
     ],
 )
 def test_spec_rejects(patch, msg):
@@ -127,14 +228,27 @@ DEEP = "/".join(["d" * 200] * 25)  # about 5,000 bytes, past PATH_MAX
     ],
     ids=["outside-link-to-root-file", "link-source-past-path-max", "mode-on-link"],
 )
-def test_hard_links_build_as_predicted(trees, base):
+def test_hard_links_build_as_declared(trees, base):
     """Link cases no committed fixture has: a source in the other tree, built
     second, and a source path too long to name in one string."""
     fx = parse_fixture({**MINIMAL, **trees}, "t")
     base.mkdir(parents=True, exist_ok=True)
-    expected = listing(predict(fx))
-    with build_fixture(fx, base) as sb:
-        assert listing(scan(sb)) == expected
+    in_sandbox(fx, base, check_build)
+
+
+@pytest.mark.parametrize("listed", [[], ["userns"], ["nonroot", "linux", "userns"]])
+def test_mounts_imply_their_requirements(listed):
+    """Implied requirements are added once, whether or not they are also listed."""
+    mounts = [{"at": "p", "type": "proc"}]
+    fx = parse_fixture({**MINIMAL, **NS, "requires": listed, "mounts": mounts}, "t")
+    assert sorted(fx.requires) == sorted(set(listed) | {"userns", "linux"})
+
+
+def test_fixture_files_are_ascii():
+    """Non-ASCII names are written as escapes (\\u00e9, e\\u0301): spellings that differ
+    only in normalization look identical in an editor."""
+    for p in FIXTURE_DIR.glob("*.toml"):
+        assert p.read_bytes().isascii(), f"{p.name}: write non-ASCII characters as escapes"
 
 
 def test_every_file_parses_as_toml():
@@ -145,20 +259,25 @@ def test_every_file_parses_as_toml():
 
 def test_file_contents_identify_the_file(tmp_path):
     """Every regular file holds '<fixture> <tree>:<path>', distinct across the suite."""
+
+    def contents(fx, sb):
+        """Per file (hard links are one file): its names, and what it holds."""
+        files: dict[tuple[int, int], tuple[list[str], bytes]] = {}
+        for r in scan(sb):
+            if r.kind == "file":
+                base = sb.root if r.tree == "root" else sb.path
+                names, _ = files.setdefault(r.ino, ([], read_unlocked(base, r.path)))
+                names.append(f"{r.tree}:{r.path}")
+        return list(files.values())
+
     seen: dict[bytes, str] = {}
     for fx in FIXTURES:
-        with build_fixture(fx, tmp_path) as sb:
-            for r in scan(sb):
-                if r.kind != "file":
-                    continue
-                base = sb.root if r.tree == "root" else sb.path
-                try:
-                    data = (base / r.path).read_bytes()
-                except PermissionError:
-                    continue  # under a mode-000 directory; scan already saw it
-                assert data == f"{fx.name} {r.tree}:{r.path}\n".encode()
-                assert data not in seen, f"{data!r} also in {seen[data]}"
-                seen[data] = fx.name
+        if fx.mounts and not ns.mounts_available():
+            continue
+        for names, data in in_sandbox(fx, tmp_path, contents):
+            assert data in {f"{fx.name} {n}\n".encode() for n in names}, (names, data)
+            assert data not in seen, f"{data!r} also in {seen[data]}"
+            seen[data] = fx.name
     assert seen
 
 
@@ -167,8 +286,7 @@ def test_format_example_is_valid():
     text = (FIXTURE_DIR.parent / "FORMAT.md").read_text()
     block = text.split("```toml\n", 1)[1].split("```", 1)[0]
     fx = parse_fixture(tomllib.loads(block), "format-example", "FORMAT.md")
-    with build_fixture(fx, "/dev/shm") as sb:
-        assert listing(scan(sb)) == listing(predict(fx))
+    in_sandbox(fx, Path("/dev/shm"), check_build)
 
 
 SNAPSHOT_FX = {
@@ -188,9 +306,9 @@ def test_snapshot_outside_is_stable_and_restores_modes(tmp_path):
     fx = parse_fixture(SNAPSHOT_FX, "snap")
     with build_fixture(fx, tmp_path) as sb:
         before = snapshot_outside(sb)
-        assert before["locked/inner"][3] == b"snap outside:locked/inner\n"
+        assert before["locked/inner"][4] == b"snap outside:locked/inner\n"
         assert snapshot_outside(sb) == before
-        assert listing(scan(sb)) == listing(predict(fx))  # modes put back
+        check_build(fx, sb)  # modes put back
 
 
 @pytest.mark.parametrize(
@@ -222,7 +340,7 @@ def test_build_failure_removes_sandbox(tmp_path, monkeypatch):
     def boom(*args):
         raise OSError("injected")
 
-    monkeypatch.setattr("treegen.build.apply_modes", boom)
+    monkeypatch.setattr("treegen.build._apply_modes", boom)
     with pytest.raises(OSError, match="injected"):
         build_fixture(fx, tmp_path)
     assert list(tmp_path.iterdir()) == []

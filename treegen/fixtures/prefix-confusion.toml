@@ -1,5 +1,6 @@
 hazard = "Comparing paths as strings"
-about = "A sibling whose name extends the root's name passes a string-prefix check."
+about = """A string-prefix check calls ../foobar/x inside root foo, because foobar starts with \
+foo. Containment must compare whole path components."""
 root_name = "foo"
 
 [root]

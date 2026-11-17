@@ -1,5 +1,6 @@
 hazard = "Symlink escape"
-about = "A relative symlink climbs out of the root with .."
+about = """A symlink need not be absolute to escape: relative text with enough .. climbs out of \
+the root."""
 
 [root]
 symlinks = { "a/link" = "../../x" }

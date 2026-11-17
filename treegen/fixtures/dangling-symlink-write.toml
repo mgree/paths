@@ -1,5 +1,6 @@
 hazard = "Dangling symlinks"
-about = "write (O_CREAT without O_EXCL) through an absolute dangling symlink must not create its target outside the root."
+about = """write creates whatever a dangling final symlink names. This one is absolute and names \
+a path outside the root, which must not be created."""
 
 [root]
 symlinks = { "new" = "{sandbox}/created" }

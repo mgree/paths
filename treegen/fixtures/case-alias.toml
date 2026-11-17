@@ -1,0 +1,18 @@
+hazard = "Case and Unicode folding"
+about = """Control: the filesystem decides whether two names match. This directory folds case, so \
+foo names Foo, and a strategy that compares names itself must not miss it."""
+
+[root]
+files = ["ci/Foo"]
+
+[[mounts]]
+at = "ci"
+type = "casefold"
+
+[request]
+op = "read"
+path = "ci/foo"
+
+[expect]
+result = "ok"
+file = "ci/Foo"

@@ -1,5 +1,6 @@
 hazard = "Joining onto an absolute path"
-about = "An absolute request must not escape; IN_ROOT strategies re-anchor it."
+about = """An absolute request names a host path, not one inside the root. Beneath strategies \
+must refuse it; in-root strategies read it as relative to the root."""
 
 [root]
 files = ["etc/passwd"]
