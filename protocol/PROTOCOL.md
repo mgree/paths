@@ -62,7 +62,7 @@ messages, etc.): the runner records it but never parses it.
 ```
 OUTCOME <count> ok <dev> <ino>
 OUTCOME <count> ok
-OUTCOME <count> error <errno>
+OUTCOME <count> error <label>
 TIME <nanoseconds>
 HIST <lower> <count>
 ```
@@ -72,12 +72,14 @@ HIST <lower> <count>
   + `ok <dev> <ino>`: the open succeeded. `<dev>` and `<ino>` are the opened
     file's `st_dev` and `st_ino`, in decimal.
   + `ok` alone: the open succeeded, in `time`, which does not `fstat`.
-  + `error <errno>`: the strategy failed. `<errno>` is the errno number in
-    decimal, which the runner turns into a name on the same host. An error
-    that carries no errno (a Java exception, for instance) is reported as a
-    label instead: a stable identifier without spaces, such as
-    `NoSuchFileException`. Report the errno whenever the language exposes
-    one, even if it is wrapped inside another error.
+  + `error <label>`: the strategy failed. `<label>` names the error, without
+    spaces. It is the errno's name (`ENOENT`) whenever the language exposes
+    an errno, even one wrapped inside another error; otherwise it is the
+    language's own stable identifier, such as the Java exception
+    `NoSuchFileException`.
+  + Any of an errno's names will do where it has several (`EAGAIN` and
+    `EWOULDBLOCK`, say): the runner compares errno labels by their value on
+    the host. An errno the driver cannot name is `E<number>`, such as `E133`.
 - `TIME` (from `once` and `time`) is the total time of the measured calls, in
   nanoseconds, measured by the driver around the calls alone. The mean is
   `TIME` divided by the `OUTCOME` counts' sum.
