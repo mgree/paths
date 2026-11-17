@@ -1,6 +1,7 @@
 """Health checks for the hand-written correctness fixtures."""
 
 import os
+import stat
 import tomllib
 from pathlib import Path
 
@@ -69,6 +70,17 @@ MINIMAL = {
         ({"root": {"files": ["a//b"]}}, "normal relative"),
         ({"root": {"files": ["a", "a/b"]}}, "has children"),
         ({"root": {"symlinks": {"l": "x"}, "modes": {"l": 0}}}, "mode on symlink"),
+        (
+            {
+                "root": {
+                    "files": ["f"],
+                    "hardlinks": {"h": "root:f"},
+                    "modes": {"f": 0, "h": 0o600},
+                },
+            },
+            "conflicting modes",
+        ),
+        ({"expect": {"result": "refused", "in_root": "error"}}, "in_root must be a table"),
         ({"root": {"modes": {"nothere": 0}}}, "undeclared"),
         ({"root": {"files": ["a/x"], "modes": {"a/y": 0}}}, "undeclared"),
         ({"root": {"hardlinks": {"h": "/etc/passwd"}}}, "root:<path> or outside:<path>"),
@@ -97,6 +109,32 @@ MINIMAL = {
 def test_spec_rejects(patch, msg):
     with pytest.raises(SpecError, match=msg):
         parse_fixture({**MINIMAL, **patch}, "t")
+
+
+DEEP = "/".join(["d" * 200] * 25)  # about 5,000 bytes, past PATH_MAX
+
+
+@pytest.mark.parametrize("base", BASES.values(), ids=BASES.keys())
+@pytest.mark.parametrize(
+    "trees",
+    [
+        {"root": {"files": ["f"]}, "outside": {"hardlinks": {"h": "root:f"}}},
+        {"root": {"files": [f"{DEEP}/f"], "hardlinks": {"h": f"root:{DEEP}/f"}}},
+        {
+            "root": {"files": ["f"]},
+            "outside": {"hardlinks": {"h": "root:f"}, "modes": {"h": 0o600}},
+        },
+    ],
+    ids=["outside-link-to-root-file", "link-source-past-path-max", "mode-on-link"],
+)
+def test_hard_links_build_as_predicted(trees, base):
+    """Link cases no committed fixture has: a source in the other tree, built
+    second, and a source path too long to name in one string."""
+    fx = parse_fixture({**MINIMAL, **trees}, "t")
+    base.mkdir(parents=True, exist_ok=True)
+    expected = listing(predict(fx))
+    with build_fixture(fx, base) as sb:
+        assert listing(scan(sb)) == expected
 
 
 def test_every_file_parses_as_toml():
@@ -206,3 +244,12 @@ def test_scan_and_snapshot_close_their_descriptors(tmp_path):
         scan(sb)
         snapshot_outside(sb)
         assert _open_fds() == fds
+
+
+def test_mode_on_a_hard_link_reaches_the_file(tmp_path):
+    trees = {
+        "root": {"files": ["f"]},
+        "outside": {"hardlinks": {"h": "root:f"}, "modes": {"h": 0o600}},
+    }
+    with build_fixture(parse_fixture({**MINIMAL, **trees}, "t"), tmp_path) as sb:
+        assert stat.S_IMODE(os.stat(sb.root / "f").st_mode) == 0o600

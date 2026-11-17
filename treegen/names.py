@@ -139,14 +139,3 @@ class NameGen:
                 keys.add(key)
                 return name
         raise SpecError(f"could not find a fresh name in {directory!r}; widen lengths or classes")
-
-
-def classes_of(name: str) -> set[str]:
-    """Which classes a name's characters come from (fill counts as lower)."""
-    found = set()
-    for c in name:
-        hit = [k for k, pool in CLASSES.items() if c in pool]
-        if not hit:
-            raise ValueError(f"character {c!r} is in no class")
-        found.update(hit)
-    return found

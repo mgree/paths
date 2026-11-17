@@ -114,9 +114,6 @@ class Fixture:
     expect_in_root: tuple[Expect, ...]  # accepted outcomes, RESOLVE_IN_ROOT-style
     outside_changes: tuple[str, ...] = ()  # [outside] files allowed to change; default none
 
-    def tree(self, which: str) -> Tree:
-        return self.root if which == "root" else self.outside
-
 
 def check_entry_path(path: str) -> None:
     if not isinstance(path, str) or not path:
@@ -212,6 +209,31 @@ def parse_outcomes(table: dict, where: str) -> tuple[Expect, ...]:
     return out
 
 
+def _check_hardlinks(root: Tree, outside: Tree, source: str) -> None:
+    """Each hard link names a declared file. A link and its source are one
+    file with one mode, so a mode may be written on any of them; it is copied
+    to all, and two different modes for one file are an error."""
+    trees = {"root": root, "outside": outside}
+    names: dict[tuple[str, str], list[tuple[str, str]]] = {}  # source -> its names
+    for label, tree in trees.items():
+        for e in tree.entries.values():
+            if e.kind == "hardlink":
+                src_tree, src = split_ref(e.link)
+                src_entry = trees[src_tree].entries.get(src)
+                if src_entry is None or src_entry.kind != "file":
+                    raise SpecError(f"{source}: hard link {label}:{e.path} needs a file {e.link!r}")
+                names.setdefault((src_tree, src), [(src_tree, src)]).append((label, e.path))
+    for group in names.values():
+        modes = {m for t, p in group if (m := trees[t].entries[p].mode) is not None}
+        if len(modes) > 1:
+            listed = ", ".join(f"{t}:{p}" for t, p in group)
+            raise SpecError(f"{source}: conflicting modes for one file ({listed})")
+        if modes:
+            mode = modes.pop()
+            for t, p in group:
+                trees[t].set_mode(p, mode)
+
+
 def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
     """name is the fixture's identifier: its file name without .toml."""
     _keys(
@@ -243,13 +265,7 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
     outside = parse_tree(data.get("outside", {}), "outside")
     if root_name in outside.entries or any(p.startswith(root_name + "/") for p in outside.entries):
         raise SpecError(f"{source}: [outside] collides with root_name {root_name!r}")
-    for label, tree in (("root", root), ("outside", outside)):
-        for e in tree.entries.values():
-            if e.kind == "hardlink":
-                src_tree, src = split_ref(e.link)
-                src_entry = (root if src_tree == "root" else outside).entries.get(src)
-                if src_entry is None or src_entry.kind != "file":
-                    raise SpecError(f"{source}: hard link {label}:{e.path} needs a file {e.link!r}")
+    _check_hardlinks(root, outside, source)
     req = data.get("request")
     if not isinstance(req, dict):
         raise SpecError(f"{source}: [request] is required")
@@ -260,6 +276,8 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
     if not isinstance(exp, dict):
         raise SpecError(f"{source}: [expect] is required")
     in_root_table = exp.get("in_root")
+    if in_root_table is not None and not isinstance(in_root_table, dict):
+        raise SpecError(f"{source}: expect.in_root must be a table")
     changes = tuple(_str_list(exp.get("outside_changes", []), "expect.outside_changes"))
     for c in changes:
         e = outside.entries.get(c)

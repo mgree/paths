@@ -15,11 +15,24 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from .spec import Fixture, Tree, split_ref
+from .spec import Entry, Fixture, Tree, split_ref
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def expand(text: str, root: Path, sandbox: Path) -> str:
+    """Replace the {root} and {sandbox} placeholders in symlink text."""
+    return text.replace("{root}", str(root)).replace("{sandbox}", str(sandbox))
+
+
+def unexpand(text: str, root: Path, sandbox: Path) -> str:
+    """Put the placeholders back; the root, being longer, wins over the sandbox."""
+    for real, ph in ((str(root), "{root}"), (str(sandbox), "{sandbox}")):
+        if text == real or text.startswith(real + "/"):
+            return ph + text[len(real) :]
+    return text
 
 
 class Sandbox:
@@ -31,15 +44,6 @@ class Sandbox:
         self.root = self.path / root_name
         os.mkdir(self.root, 0o755)
         os.chmod(self.root, 0o755)
-
-    def expand(self, text: str) -> str:
-        return text.replace("{root}", str(self.root)).replace("{sandbox}", str(self.path))
-
-    def unexpand(self, text: str) -> str:
-        for real, ph in ((str(self.root), "{root}"), (str(self.path), "{sandbox}")):
-            if text == real or text.startswith(real + "/"):
-                return ph + text[len(real) :]
-        return text
 
     def remove(self) -> None:
         _make_traversable(self.path)
@@ -114,23 +118,33 @@ def file_contents(fixture: str, tree: str, path: str) -> bytes:
     return f"{fixture} {tree}:{path}\n".encode()
 
 
-def build_tree(base_fd: int, tree: Tree, label: str, sandbox: Sandbox, fixture: str) -> None:
-    entries = tree.sorted()  # parents sort before children
-    order = {"dir": 0, "file": 1, "hardlink": 2, "symlink": 3}
-    for e in sorted(entries, key=lambda e: (order[e.kind], e.path.count("/"), e.path)):
-        head, name = _split(e.path)
-        with open_dir(base_fd, head) as fd:
-            if e.kind == "dir":
-                os.mkdir(name, 0o700, dir_fd=fd)
-            elif e.kind == "file":
-                with opened(name, NEW_FILE_FLAGS, 0o600, dir_fd=fd) as ffd:
-                    os.write(ffd, file_contents(fixture, label, e.path))
-            elif e.kind == "hardlink":
-                src_tree, src = split_ref(e.link)
-                base = sandbox.root if src_tree == "root" else sandbox.path
-                os.link(base / src, name, dst_dir_fd=fd, follow_symlinks=False)
-            else:
-                os.symlink(sandbox.expand(e.link), name, dir_fd=fd)
+def build_trees(fds: dict[str, int], fx: Fixture, sb: Sandbox) -> None:
+    """Create both trees in phases, one kind of entry at a time across both:
+    every directory and file exists before any hard link names it as a source,
+    whichever tree it is in. fds maps "root" and "outside" to their bases."""
+    trees = (("outside", fx.outside), ("root", fx.root))
+    for kind in ("dir", "file", "hardlink", "symlink"):
+        for label, tree in trees:
+            for e in tree.sorted():  # parents sort before children
+                if e.kind == kind:
+                    _create(fds, label, e, fx.name, sb)
+
+
+def _create(fds: dict[str, int], label: str, e: Entry, fixture: str, sb: Sandbox) -> None:
+    head, name = _split(e.path)
+    with open_dir(fds[label], head) as fd:
+        if e.kind == "dir":
+            os.mkdir(name, 0o700, dir_fd=fd)
+        elif e.kind == "file":
+            with opened(name, NEW_FILE_FLAGS, 0o600, dir_fd=fd) as ffd:
+                os.write(ffd, file_contents(fixture, label, e.path))
+        elif e.kind == "hardlink":
+            src_tree, src = split_ref(e.link)
+            src_head, src_name = _split(src)
+            with open_dir(fds[src_tree], src_head) as sfd:
+                os.link(src_name, name, src_dir_fd=sfd, dst_dir_fd=fd, follow_symlinks=False)
+        else:
+            os.symlink(expand(e.link, sb.root, sb.path), name, dir_fd=fd)
 
 
 def apply_modes(base_fd: int, tree: Tree) -> None:
@@ -150,8 +164,7 @@ def build_fixture(fx: Fixture, base: str | Path | None = None) -> Sandbox:
     with ExitStack() as stack:
         sb = stack.enter_context(Sandbox(base, fx.root_name))
         with opened(sb.path, DIR_FLAGS) as top, opened(sb.root, DIR_FLAGS) as root:
-            build_tree(top, fx.outside, "outside", sb, fx.name)
-            build_tree(root, fx.root, "root", sb, fx.name)
+            build_trees({"outside": top, "root": root}, fx, sb)
             apply_modes(top, fx.outside)
             apply_modes(root, fx.root)
         stack.pop_all()  # success: keep the sandbox, now the caller's
@@ -201,25 +214,21 @@ def _canonical_hardlinks(
 
 def predict(fx: Fixture) -> list[Record]:
     """The listing a correct build of fx produces, computed from the spec alone."""
-    probe = _ProbeSandbox(fx.root_name)
+    # Placeholders round-trip through made-up paths, as scan's do through real
+    # ones, so text such as {sandbox}/root/x predicts scan's {root}/x.
+    sandbox = Path("/nonexistent-sandbox")
+    root = sandbox / fx.root_name
     records, links = [], []
-    for label in ("outside", "root"):
-        for e in fx.tree(label).sorted():
+    for label, tree in (("outside", fx.outside), ("root", fx.root)):
+        for e in tree.sorted():
             target = e.target
             if e.kind == "symlink":
-                target = probe.unexpand(probe.expand(e.link))
+                target = unexpand(expand(e.link, root, sandbox), root, sandbox)
             if e.kind == "hardlink":
                 links.append(((label, e.path), split_ref(e.link)))
             records.append(Record(label, e.path, e.kind, e.effective_mode(), target))
     groups = _union(links)
     return _canonical_hardlinks(records, groups)
-
-
-class _ProbeSandbox(Sandbox):
-    def __init__(self, root_name: str):  # no directory: expand/unexpand only
-        self.path = Path("/nonexistent-sandbox")
-        self.root_name = root_name
-        self.root = self.path / root_name
 
 
 def _union(pairs: list[tuple[tuple, tuple]]) -> list[list[tuple]]:
@@ -259,7 +268,7 @@ def _scan_dir(fd, prefix, sb, records, inodes) -> None:
         mode = stat.S_IMODE(st.st_mode)
         if stat.S_ISLNK(st.st_mode):
             text = os.readlink(name, dir_fd=fd)
-            records.append(Record(tree, path, "symlink", None, sb.unexpand(text)))
+            records.append(Record(tree, path, "symlink", None, unexpand(text, sb.root, sb.path)))
         elif stat.S_ISREG(st.st_mode):
             records.append(Record(tree, path, "file", mode, None))
             inodes.setdefault((st.st_dev, st.st_ino), []).append((tree, path))

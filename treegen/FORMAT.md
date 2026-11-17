@@ -82,12 +82,14 @@ relative to the root, `[outside]` paths to the sandbox. All keys are optional.
   + `{root}` and `{sandbox}` expand to the absolute paths of this build, for
     links that must spell a host path. Nothing else is templated.
 - `hardlinks` maps a link's path to a file declared in either tree, written
-  `root:<path>` or `outside:<path>`. The link and its source are one file,
-  and share its mode.
-- `modes` maps a declared directory or file (not a symlink) to its permission
-  bits; the defaults are `0o755` for directories and `0o644` for files. Modes
-  are set after the whole tree exists, so a directory can hold entries and
-  still be unsearchable (`0o000` gives EACCES).
+  `root:<path>` or `outside:<path>`. The link and its source are one file
+  with one mode.
+- `modes` maps a declared directory, file or hard link (not a symlink) to its
+  permission bits; the defaults are `0o755` for directories and `0o644` for
+  files. Modes are set after the whole tree exists, so a directory can hold
+  entries and still be unsearchable (`0o000` gives EACCES).
+  + A mode on a hard link or on its source sets the one file's mode. Two
+    different modes for one file are an error.
 
 The `[request]` is what the strategy is asked to do; both keys are required.
 
