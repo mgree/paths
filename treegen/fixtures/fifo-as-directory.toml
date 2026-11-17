@@ -1,0 +1,17 @@
+hazard = "Special files"
+about = """A request that treats a FIFO as a directory. The kernel checks the type of each \
+component it passes through without opening it, so the answer is ENOTDIR at once; a \
+userspace walk that opens each component with plain O_RDONLY instead blocks on the FIFO \
+before learning it is not a directory. Walks must open components with O_DIRECTORY or \
+O_PATH."""
+
+[root]
+fifos = ["pipe"]
+
+[request]
+op = "read"
+path = "pipe/x"
+
+[expect]
+result = "error"
+errno = "ENOTDIR"

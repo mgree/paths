@@ -1,0 +1,14 @@
+hazard = "Special files"
+about = """A trailing slash says the last component is a directory, so pipe/ is ENOTDIR. \
+A strategy that strips the slash before opening blocks on the FIFO instead."""
+
+[root]
+fifos = ["pipe"]
+
+[request]
+op = "read"
+path = "pipe/"
+
+[expect]
+result = "error"
+errno = "ENOTDIR"
