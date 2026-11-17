@@ -27,7 +27,8 @@ There are four modes:
 
 Arguments:
 
-- `<strategy>` is one of the implemented strategies (i.e., from `driver list`).
+- `<strategy>` is one of the implemented strategies (i.e., from
+  `driver list`).
 - `<op>` is the operation, as in fixtures.
   + `read`: `O_RDONLY`.
   + `newfile`: `O_WRONLY|O_CREAT|O_EXCL`.
@@ -52,7 +53,8 @@ the driver makes one call; the `race` and `time` modes repeat the same call.
 
 In `once` and `race` modes the driver also runs `fstat` on the descriptor
 before closing it, to identify the file reached. `time` mode skips the
-`fstat`, which would otherwise be measured; `once` mode stops its clock for it.
+`fstat`, which would otherwise be measured; `once` mode stops its clock for
+it.
 
 ## Output
 
@@ -77,12 +79,18 @@ HIST <lower> <count>
     an errno, even one wrapped inside another error; otherwise it is the
     language's own stable identifier, such as the Java exception
     `NoSuchFileException`.
+  + A strategy that decides an error itself reports an errno when it
+    reproduces what the kernel would say for that lookup (`ELOOP` after too
+    many symlinks, `ENOTDIR` for a file used as a directory), and a lowercase
+    label when it refuses for its own reasons (`escape` for a path that would
+    leave the root, `not-regular` for a FIFO opened as a file). Lowercase
+    keeps such labels apart from errno names.
   + Any of an errno's names will do where it has several (`EAGAIN` and
     `EWOULDBLOCK`, say): the runner compares errno labels by their value on
     the host. An errno the driver cannot name is `E<number>`, such as `E133`.
 - `TIME` (from `once` and `time`) is the total time of the measured calls, in
-  nanoseconds, measured by the driver around the calls alone. The mean is
-  `TIME` divided by the `OUTCOME` counts' sum.
+  nanoseconds, measured by the driver around the calls alone. The arithmetic
+  mean is `TIME` divided by the `OUTCOME` counts' sum.
 - `HIST` (from `time` only) describes the distribution: `time` reads the clock
   around every call, and prints one line per nonempty bucket, in increasing
   order of `<lower>`. `<count>` is the number of calls in that bucket.
