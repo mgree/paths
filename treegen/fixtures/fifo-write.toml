@@ -1,0 +1,13 @@
+hazard = "Special files"
+about = """As fifo-read, for write: a plain open for writing waits for a reader that never \
+comes."""
+
+[root]
+fifos = ["pipe"]
+
+[request]
+op = "write"
+path = "pipe"
+
+[expect]
+result = "refused"

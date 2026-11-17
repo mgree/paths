@@ -14,7 +14,7 @@ from pathlib import Path
 DIR_MODE = 0o755
 FILE_MODE = 0o644
 
-KINDS = ("dir", "file", "symlink", "hardlink")
+KINDS = ("dir", "file", "fifo", "symlink", "hardlink")
 TREES = ("root", "outside")
 REQUIRES = ("nonroot", "userns", "linux")
 # read: O_RDONLY, the file must exist. newfile: O_WRONLY|O_CREAT|O_EXCL, the
@@ -166,12 +166,14 @@ def _str_map(v, where: str) -> dict[str, str]:
 
 
 def parse_tree(table: dict, where: str) -> Tree:
-    _keys(table, {"dirs", "files", "symlinks", "hardlinks", "modes"}, where)
+    _keys(table, {"dirs", "files", "fifos", "symlinks", "hardlinks", "modes"}, where)
     tree = Tree()
     for p in _str_list(table.get("dirs", []), f"{where}.dirs"):
         tree.add(Entry(p, "dir"))
     for p in _str_list(table.get("files", []), f"{where}.files"):
         tree.add(Entry(p, "file"))
+    for p in _str_list(table.get("fifos", []), f"{where}.fifos"):
+        tree.add(Entry(p, "fifo"))
     for p, t in _str_map(table.get("symlinks", {}), f"{where}.symlinks").items():
         if not t:
             raise SpecError(f"empty symlink target for {p!r}")

@@ -1,8 +1,10 @@
 """Health checks for the hand-written correctness fixtures."""
 
 import os
+import signal
 import stat
 import tomllib
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -116,7 +118,13 @@ def test_has_outside_or_not_an_escape(fx):
     """A read escape needs an outside file to land on, or the runner cannot tell
     an escape from a miss. (newfile and write escapes create something outside,
     which the outside snapshot catches even when [outside] is empty.)"""
-    escapes = fx.request.op == "read" and all(e.result == "refused" for e in fx.expect)
+    target = fx.root.entries.get(fx.request.path)
+    names_own_entry = target is not None and target.kind != "symlink"  # e.g. a FIFO
+    escapes = (
+        fx.request.op == "read"
+        and all(e.result == "refused" for e in fx.expect)
+        and not names_own_entry
+    )
     links_out = any((e.target or "").startswith("{sandbox}") for e in fx.root.entries.values())
     targets_outside = bool(fx.outside.entries) or links_out or fx.request.path.startswith("/")
     assert not escapes or targets_outside
@@ -327,6 +335,43 @@ def test_snapshot_outside_sees_changes(tmp_path, change):
         before = snapshot_outside(sb)
         change(sb.path)
         assert snapshot_outside(sb) != before
+
+
+@contextmanager
+def deadline(seconds: int):
+    """Fail instead of hanging: an accidental open of a FIFO blocks forever."""
+
+    def expired(signum, frame):
+        raise TimeoutError(f"still running after {seconds} s")
+
+    old = signal.signal(signal.SIGALRM, expired)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+FIFO_FX = {
+    **MINIMAL,
+    "root": {"fifos": ["p"]},
+    "outside": {"files": ["f"], "fifos": ["q", "locked/r"], "modes": {"locked": 0}},
+}
+
+
+def test_fifos_are_never_opened(tmp_path):
+    """Build, scan, snapshot and removal finish with FIFOs on both sides, even
+    under a mode-000 directory; reading one is refused, not waited on."""
+    fx = parse_fixture(FIFO_FX, "t")
+    with deadline(5):
+        with build_fixture(fx, tmp_path) as sb:
+            check_build(fx, sb)
+            snap = snapshot_outside(sb)
+            assert snap["q"][0] == "fifo" and snap["q"][4] is None
+            assert snap["f"][4] == b"t outside:f\n"
+            with pytest.raises(ValueError, match="not a regular file"):
+                read_unlocked(sb.path, "q")
 
 
 def _open_fds() -> set[str]:

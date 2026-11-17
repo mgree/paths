@@ -29,6 +29,7 @@ requires  = ["nonroot"]              # optional: nonroot, userns, linux
 [root]                               # entries inside the root
 dirs      = ["a", "real", "locked", "m"]
 files     = ["real/f"]               # contents: see below
+fifos     = ["pipe"]                 # named pipes (mkfifo)
 symlinks  = { "a/link" = "../../x" } # path = link text, written verbatim
 hardlinks = { "h" = "outside:secret" }  # path = an existing file, as <tree>:<path>
 modes     = { "locked" = 0o000 }     # permission bits; default 0o755 dirs, 0o644 files
@@ -83,6 +84,8 @@ relative to the root, `[outside]` paths to the sandbox. All keys are optional.
   `<fixture> <tree>:<path>` (for example `symlink-escape outside:secret/x`),
   unique across the suite. The runner identifies what a strategy reached by
   (dev, inode); the contents make stray output readable when debugging.
+- `fifos` lists named pipes. Opening one blocks until the other end is opened,
+  so nothing in our own tools ever opens them.
 - `symlinks` maps a link's path to its text, written verbatim. The text may
   dangle, climb with `..` or be absolute.
   + `{root}` and `{sandbox}` expand to the absolute paths of this build, for
@@ -90,10 +93,11 @@ relative to the root, `[outside]` paths to the sandbox. All keys are optional.
 - `hardlinks` maps a link's path to a file declared in either tree, written
   `root:<path>` or `outside:<path>`. The link and its source are one file
   with one mode.
-- `modes` maps a declared directory, file or hard link (not a symlink) to its
-  permission bits; the defaults are `0o755` for directories and `0o644` for
-  files. Modes are set after the whole tree exists, so a directory can hold
-  entries and still be unsearchable (`0o000` gives EACCES).
+- `modes` maps a declared directory, file, FIFO or hard link (not a symlink)
+  to its permission bits; the defaults are `0o755` for directories and
+  `0o644` for the rest. Modes are set after the whole tree exists, so a
+  directory can hold entries and still be unsearchable (`0o000` gives
+  EACCES).
   + A mode on a hard link or on its source sets the one file's mode. Two
     different modes for one file are an error.
 

@@ -1,0 +1,15 @@
+hazard = "Special files"
+about = """A FIFO planted where a file is expected. A plain open for reading waits for a \
+writer that never comes, hanging the program; correct strategies refuse anything but a \
+regular file without blocking (O_NONBLOCK, then fstat). A strategy that hangs is killed \
+at the runner's timeout, and fails."""
+
+[root]
+fifos = ["pipe"]
+
+[request]
+op = "read"
+path = "pipe"
+
+[expect]
+result = "refused"

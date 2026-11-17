@@ -22,7 +22,8 @@ from .spec import Entry, Fixture, Tree, split_ref
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK: a FIFO opens at once instead of waiting for a writer (we refuse it after).
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 
 def expand(text: str, root: Path, sandbox: Path) -> str:
@@ -124,7 +125,7 @@ def _build_trees(fds: dict[str, int], fx: Fixture, sb: Sandbox) -> None:
     fds maps "root" and "outside" to their bases."""
     casefold = {m.at for m in fx.mounts if m.type == "casefold"}
     trees = (("outside", fx.outside), ("root", fx.root))
-    for kind in ("dir", "file", "hardlink", "symlink"):
+    for kind in ("dir", "file", "fifo", "hardlink", "symlink"):
         for label, tree in trees:
             for e in tree.sorted():  # parents sort before children
                 if e.kind == kind:
@@ -141,6 +142,8 @@ def _create(fds: dict[str, int], label: str, e: Entry, fixture: str, sb: Sandbox
         elif e.kind == "file":
             with opened(name, NEW_FILE_FLAGS, 0o600, dir_fd=fd) as ffd:
                 os.write(ffd, _file_contents(fixture, label, e.path))
+        elif e.kind == "fifo":
+            os.mkfifo(name, 0o600, dir_fd=fd)
         elif e.kind == "hardlink":
             src_tree, src = split_ref(e.link)
             src_head, src_name = _split(src)
@@ -206,7 +209,7 @@ class Record:
 
     tree: str  # "outside" or "root"
     path: str
-    kind: str  # dir, file, symlink, or bind / proc (a mount point, not descended into)
+    kind: str  # dir, file, fifo, symlink, or bind / proc (a mount point, not descended into)
     mode: int | None  # None for symlinks
     target: str | None  # symlink text as on disk
     ino: tuple[int, int]  # (st_dev, st_ino); hard links share it
@@ -236,6 +239,8 @@ def _scan_dir(fd: int, prefix: str, sb: Sandbox, records: list[Record]) -> None:
             records.append(Record(tree, path, "symlink", None, os.readlink(name, dir_fd=fd), ino))
         elif stat.S_ISREG(st.st_mode):
             records.append(Record(tree, path, "file", mode, None, ino))
+        elif stat.S_ISFIFO(st.st_mode):  # never opened: an open would block
+            records.append(Record(tree, path, "fifo", mode, None, ino))
         elif mount in ("bind", "proc"):
             records.append(Record(tree, path, mount, mode, None, ino))
         elif stat.S_ISDIR(st.st_mode):
@@ -251,8 +256,8 @@ def _scan_dir(fd: int, prefix: str, sb: Sandbox, records: list[Record]) -> None:
 
 def snapshot_outside(sb: Sandbox) -> dict[str, tuple]:
     """Everything outside the root that a strategy could change: per entry its
-    kind, mode, link text, identity and, for files, contents. Compare before
-    and after."""
+    kind, mode, link text, identity and, for regular files, contents (only
+    those are read: opening a FIFO blocks). Compare before and after."""
     snap: dict[str, tuple] = {}
     for r in scan(sb):
         if r.tree != "outside":
@@ -263,7 +268,8 @@ def snapshot_outside(sb: Sandbox) -> dict[str, tuple]:
 
 
 def read_unlocked(top: Path, rel: str) -> bytes:
-    """Read a file even under mode-000 directories, restoring their modes."""
+    """Read a regular file even under mode-000 directories, restoring their
+    modes. Anything else is refused without blocking."""
     head, name = _split(rel)
     with ExitStack() as stack:  # unwinds innermost first: close, then restore
         fd = stack.enter_context(opened(top, DIR_FLAGS))
@@ -272,4 +278,6 @@ def read_unlocked(top: Path, rel: str) -> bytes:
             fd = stack.enter_context(opened(part, DIR_FLAGS, dir_fd=fd))
         _unlock(stack, fd, name, 0o400, 0o400)
         with opened(name, READ_FLAGS, dir_fd=fd) as ffd:
+            if not stat.S_ISREG(os.fstat(ffd).st_mode):
+                raise ValueError(f"{rel!r} is not a regular file")
             return b"".join(iter(lambda: os.read(ffd, 1 << 16), b""))
