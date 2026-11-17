@@ -36,9 +36,9 @@ def test_fold_key_catches_known_aliases():
         ("Foo", "foo"),
         ("straße", "STRASSE"),
         ("\u00e9", "e\u0301"),  # precomposed vs decomposed
-        ("ΣΑΣ", "σας"),
-        ("ﬁle", "file"),
-        ("Ǆ", "dž"),
+        ("\u03a3\u0391\u03a3", "\u03c3\u03b1\u03c2"),  # Greek SIGMA ALPHA SIGMA; final sigma
+        ("\ufb01le", "file"),  # one-character fi ligature
+        ("\u01c4", "d\u017e"),  # one character DZ-caron vs d + z-caron
     ]:
         assert fold_key(a) == fold_key(b), (a, b)
     assert fold_key("a") != fold_key("b")
