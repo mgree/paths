@@ -6,7 +6,7 @@
 For each link: absolute or relative; how far its target climbs (leading ..)
 and descends; tree distance from the link's directory to the target; whether
 the target leaves the surveyed tree; and, for directories on disk, whether it
-dangles, how long its chain of links-to-links is, and whether lexical and
+dangles, how long its chain of links-to-links is, and whether logical and
 physical resolution of the target disagree.
 """
 
@@ -27,7 +27,7 @@ class Stats:
     kinds: Counter = field(default_factory=Counter)  # absolute / relative
     relation: Counter = field(default_factory=Counter)  # sibling, descendant, ...
     up: Counter = field(default_factory=Counter)  # leading .. in relative targets
-    distance: Counter = field(default_factory=Counter)  # up + down, lexical
+    distance: Counter = field(default_factory=Counter)  # up + down, logical
     comps: Counter = field(default_factory=Counter)  # components in the target text
     flags: Counter = field(default_factory=Counter)
     chain: Counter = field(default_factory=Counter)
@@ -60,7 +60,7 @@ def relation(link_dir: str, target: str) -> tuple[str, int, int]:
 
 def classify(st: Stats, link_rel: str, text: str, top_abs: str | None) -> str | None:
     """Record the text-only properties; return the target relative to the
-    top (lexically normalized), or None when it is outside the tree."""
+    top (logically normalized), or None when it is outside the tree."""
     st.n += 1
     link_dir = posixpath.dirname(link_rel)
     parts = [p for p in text.split("/") if p not in ("", ".")]
@@ -132,7 +132,7 @@ def walk_dir(top: str, st: Stats, dirs_only: bool = False) -> int:
                 except OSError:
                     continue
             classify(st, rel, text, top_abs)
-            # On-disk extras: dangling, chain length, target kind, lexical vs physical.
+            # On-disk extras: dangling, chain length, target kind, logical vs physical.
             hops, p = 0, path
             while hops <= 40:
                 try:
@@ -148,9 +148,9 @@ def walk_dir(top: str, st: Stats, dirs_only: bool = False) -> int:
                 s = os.stat(path)
                 st.target_kind["directory" if stat.S_ISDIR(s.st_mode) else "file"] += 1
                 physical = os.path.realpath(path)
-                lexical = os.path.realpath(posixpath.normpath(os.path.join(dirpath, text)))
-                if physical != lexical:
-                    st.flags["lexical and physical resolution disagree"] += 1
+                logical = os.path.realpath(posixpath.normpath(os.path.join(dirpath, text)))
+                if physical != logical:
+                    st.flags["logical and physical resolution disagree"] += 1
             except OSError:
                 st.target_kind["dangling"] += 1
     return errors

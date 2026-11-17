@@ -1,6 +1,6 @@
 hazard = "Symlink escape"
 about = """An absolute link that spells the root's own host path stays inside, but only a \
-resolve-then-check strategy (S2) can follow it. Both are accepted; opening leaks the \
+resolve-then-check strategy (realpath) can follow it. Both are accepted; opening leaks the \
 root's host location to whoever can plant links."""
 
 [root]

@@ -67,7 +67,7 @@ appear only at the levels its tree config places them:
 |---|---|---|
 | spine | `D(k+1)/` | the path itself (not at the last level) |
 | sibling chain | `l1 -> D(k+1)`, `l2 -> l1`, ... | symlink hops: entering at `lj` costs j hops |
-| cousin link | `c -> D(k+1)/e` | `c/..` lands in `D(k+1)` physically, `Dk` lexically |
+| cousin link | `c -> D(k+1)/e` | `c/..` lands in `D(k+1)` physically, `Dk` logically |
 | empty dir | `e/` | `X/..` detours; the cousin link's target |
 | target file | `f` | depth-k queries end here; `f/x` gives ENOTDIR |
 | file link | `fl -> f` | queries that end on a link, the common real case |
@@ -83,7 +83,7 @@ Rules:
 - Links resolve inside their own tree, or (escape links only) into
   `outside/`. Never into another tree.
 - Benign links are relative, stay inside the tree, and never start with `..`.
-- Names in `D(k+1)` never fold onto names in `Dk`, so a lexical strategy that
+- Names in `D(k+1)` never fold onto names in `Dk`, so a logical strategy that
   cancels `c/..` gets a clean ENOENT, never a wrong file.
 - Absolute links appear only in correctness fixtures (scoped lookup refuses
   or re-anchors them, so they are a policy question).
@@ -123,7 +123,7 @@ Forests also serve as the per-thread copies for multi-threaded cells.
   RESOLVE_NO_SYMLINKS, so the 41-hop failure alone can't tell a correct
   strategy from one that refuses every link.
 - **`..` after a cousin link**: physical strategies continue in `D(k+1)`;
-  lexical ones (S1) land in `Dk` and get ENOENT, by the no-fold rule above.
+  logical ones land in `Dk` and get ENOENT, by the no-fold rule above.
 - **newfile and write queries** change the tree: they leave created files
   behind, and a write to an existing file truncates it. Unlink created names
   in batches outside the timed region, aim writes only at files no other
