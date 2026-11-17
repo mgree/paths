@@ -3,6 +3,8 @@ name = "paths-study"
 version = "0.0.1"
 description = "Path handling correctness and cost study"
 requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 dependencies = []
 
 [dependency-groups]
