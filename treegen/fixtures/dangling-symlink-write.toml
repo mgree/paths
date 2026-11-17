@@ -1,0 +1,16 @@
+hazard = "Dangling symlinks"
+about = "write (O_CREAT without O_EXCL) through an absolute dangling symlink must not create its target outside the root."
+
+[root]
+symlinks = { "new" = "{sandbox}/created" }
+
+[request]
+op = "write"
+path = "new"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "error"
+errno = "ENOENT"   # re-anchored inside the root, where the target's parents don't exist

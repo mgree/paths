@@ -1,0 +1,13 @@
+hazard = "Missing tail"
+about = "missing/../x collapses lexically to x, but the kernel refuses it."
+
+[root]
+files = ["x"]
+
+[request]
+op = "read"
+path = "missing/../x"
+
+[expect]
+result = "error"
+errno = "ENOENT"

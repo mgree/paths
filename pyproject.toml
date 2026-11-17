@@ -1,0 +1,25 @@
+[project]
+name = "paths-study"
+version = "0.0.1"
+description = "Path handling correctness and cost study"
+requires-python = ">=3.12"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest==9.2.0", "ruff==0.17.5", "pyright==1.1.414"]  # pinned: formatter output changes between releases
+
+[tool.pytest.ini_options]
+testpaths = ["treegen/tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.pyright]
+include = ["treegen", "tools"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+reportDeprecated = "error"
+venvPath = "."
+venv = ".venv"

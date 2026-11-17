@@ -1,0 +1,19 @@
+hazard = ".. escape"
+about = "Plain .. components that climb above the root."
+
+[root]
+dirs = ["a"]
+
+[outside]
+files = ["x"]
+
+[request]
+op = "read"
+path = "a/../../x"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "error"
+errno = "ENOENT"

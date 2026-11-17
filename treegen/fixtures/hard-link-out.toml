@@ -1,0 +1,16 @@
+hazard = "Hard links"
+about = "A hard link inside the root to a file outside. Containment cannot see it; only an st_nlink policy can."
+
+[root]
+hardlinks = { "h" = "outside:secret" }
+
+[outside]
+files = ["secret"]
+
+[request]
+op = "read"
+path = "h"
+
+[expect]
+result = "ok"
+file = "h"

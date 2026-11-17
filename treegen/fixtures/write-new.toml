@@ -1,0 +1,13 @@
+hazard = "Dangling symlinks"
+about = "Control: write creates a new file inside the root."
+
+[root]
+dirs = ["a"]
+
+[request]
+op = "write"
+path = "a/new"
+
+[expect]
+result = "ok"
+file = "a/new"

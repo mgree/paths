@@ -1,0 +1,19 @@
+hazard = "Hard links"
+about = "write through a hard link to an outside file truncates that file: containment cannot see hard links. Only an st_nlink policy refuses it."
+
+[root]
+hardlinks = { "h" = "outside:secret" }
+
+[outside]
+files = ["secret"]
+
+[request]
+op = "write"
+path = "h"
+
+[expect]
+accept = [
+  { result = "ok", file = "h" },
+  { result = "refused" },   # a strategy enforcing an st_nlink policy
+]
+outside_changes = ["secret"]

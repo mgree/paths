@@ -1,0 +1,19 @@
+hazard = "Symlink escape"
+about = "write through a final-component symlink to an outside file must not truncate it (the classic /tmp symlink attack)."
+
+[root]
+symlinks = { "link" = "{sandbox}/secret" }
+
+[outside]
+files = ["secret"]
+
+[request]
+op = "write"
+path = "link"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "error"
+errno = "ENOENT"

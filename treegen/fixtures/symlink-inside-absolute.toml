@@ -1,0 +1,24 @@
+hazard = "Symlink escape"
+about = """An absolute symlink spelling the root's host path. No scoped lookup can \
+follow it; resolve-then-check (S2) opens it. Opening is accepted, but it leaks: \
+whoever can plant symlinks in the root can probe for the root's host path."""
+
+[root]
+files = ["real/f"]
+symlinks = { "link" = "{root}/real" }
+
+[request]
+op = "read"
+path = "link/f"
+
+[expect]
+accept = [
+  { result = "refused" },
+  { result = "ok", file = "real/f" },
+]
+
+[expect.in_root]
+accept = [
+  { result = "error", errno = "ENOENT" },
+  { result = "ok", file = "real/f" },
+]

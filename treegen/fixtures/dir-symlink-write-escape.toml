@@ -1,0 +1,19 @@
+hazard = "Symlink escape"
+about = "write through a directory symlink that climbs out must not create or truncate anything outside the root."
+
+[root]
+symlinks = { "d" = "../outside-dir" }
+
+[outside]
+files = ["outside-dir/f"]
+
+[request]
+op = "write"
+path = "d/f"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "error"
+errno = "ENOENT"   # .. clamps at the root, and root/outside-dir doesn't exist

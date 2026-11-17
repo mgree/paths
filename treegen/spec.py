@@ -1,0 +1,298 @@
+"""Tree and fixture descriptions: loading and validation.
+
+See FORMAT.md for the file format. Everything here is pure data; building on
+disk lives in build.py.
+"""
+
+from __future__ import annotations
+
+import errno as errno_mod
+import tomllib
+from dataclasses import dataclass, field
+from pathlib import Path
+
+DIR_MODE = 0o755
+FILE_MODE = 0o644
+
+KINDS = ("dir", "file", "symlink", "hardlink")
+TREES = ("root", "outside")
+REQUIRES = ("nonroot", "userns", "linux")
+# read: O_RDONLY, the file must exist. newfile: O_WRONLY|O_CREAT|O_EXCL, the
+# name must not exist. write: O_WRONLY|O_CREAT|O_TRUNC, what creat(2) and a
+# shell ">" do: creates or truncates, and follows a final symlink.
+OPS = ("read", "newfile", "write")
+RESULTS = ("ok", "refused", "error")
+
+
+class SpecError(ValueError):
+    pass
+
+
+@dataclass(frozen=True)
+class Entry:
+    path: str  # normal relative path within its tree
+    kind: str  # one of KINDS
+    target: str | None = None  # symlink text (verbatim), or hard-link source (<tree>:<path>)
+    mode: int | None = None  # None: default for the kind; symlinks have none
+
+    @property
+    def link(self) -> str:
+        """The target of a symlink or hard link."""
+        if self.target is None:
+            raise SpecError(f"{self.path!r} ({self.kind}) has no target")
+        return self.target
+
+    def effective_mode(self) -> int | None:
+        if self.kind == "symlink":
+            return None
+        if self.mode is not None:
+            return self.mode
+        return DIR_MODE if self.kind == "dir" else FILE_MODE
+
+
+@dataclass
+class Tree:
+    """Entries of one tree (root or outside), keyed by path, parents included."""
+
+    entries: dict[str, Entry] = field(default_factory=dict)
+
+    def add(self, entry: Entry) -> None:
+        check_entry_path(entry.path)
+        parts = entry.path.split("/")
+        for i in range(1, len(parts)):
+            self._add_dir(("/".join(parts[:i])))
+        old = self.entries.get(entry.path)
+        if old is not None and not (old.kind == entry.kind == "dir"):
+            raise SpecError(f"{entry.path!r} declared twice ({old.kind}, {entry.kind})")
+        self.entries[entry.path] = entry
+
+    def _add_dir(self, path: str) -> None:
+        old = self.entries.get(path)
+        if old is None:
+            self.entries[path] = Entry(path, "dir")
+        elif old.kind != "dir":
+            raise SpecError(f"{path!r} is a {old.kind} but has children")
+
+    def set_mode(self, path: str, mode: int) -> None:
+        old = self.entries.get(path)
+        if old is None:
+            raise SpecError(f"mode for undeclared path {path!r}")
+        if old.kind == "symlink":
+            raise SpecError(f"mode on symlink {path!r}")
+        if not 0 <= mode <= 0o7777:
+            raise SpecError(f"bad mode {mode:o} for {path!r}")
+        self.entries[path] = Entry(old.path, old.kind, old.target, mode)
+
+    def sorted(self) -> list[Entry]:
+        return [self.entries[p] for p in sorted(self.entries)]
+
+
+@dataclass(frozen=True)
+class Request:
+    op: str
+    path: str
+
+
+@dataclass(frozen=True)
+class Expect:
+    result: str
+    file: str | None = None
+    errno: str | None = None
+
+
+@dataclass
+class Fixture:
+    name: str
+    hazard: str
+    about: str
+    root_name: str
+    requires: tuple[str, ...]
+    root: Tree
+    outside: Tree
+    request: Request
+    expect: tuple[Expect, ...]  # accepted outcomes, RESOLVE_BENEATH-style strategies
+    expect_in_root: tuple[Expect, ...]  # accepted outcomes, RESOLVE_IN_ROOT-style
+    outside_changes: tuple[str, ...] = ()  # [outside] files allowed to change; default none
+
+    def tree(self, which: str) -> Tree:
+        return self.root if which == "root" else self.outside
+
+
+def check_entry_path(path: str) -> None:
+    if not isinstance(path, str) or not path:
+        raise SpecError(f"bad entry path {path!r}")
+    for part in path.split("/"):
+        if part in ("", ".", ".."):
+            raise SpecError(f"entry path {path!r} is not a normal relative path")
+        if "\0" in part:
+            raise SpecError(f"NUL in entry path {path!r}")
+
+
+def split_ref(text: str) -> tuple[str, str]:
+    """A file named as <tree>:<path>, tree being root or outside."""
+    tree, sep, path = text.partition(":")
+    if not sep or tree not in TREES:
+        raise SpecError(f"{text!r} must be root:<path> or outside:<path>")
+    check_entry_path(path)
+    return tree, path
+
+
+def _keys(table: dict, allowed: set[str], where: str) -> None:
+    extra = set(table) - allowed
+    if extra:
+        raise SpecError(f"unknown keys in {where}: {sorted(extra)}")
+
+
+def _str_list(v, where: str) -> list[str]:
+    if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+        raise SpecError(f"{where} must be a list of strings")
+    return v
+
+
+def _str_map(v, where: str) -> dict[str, str]:
+    if not isinstance(v, dict) or not all(isinstance(x, str) for x in v.values()):
+        raise SpecError(f"{where} must be a table of strings")
+    return v
+
+
+def parse_tree(table: dict, where: str) -> Tree:
+    _keys(table, {"dirs", "files", "symlinks", "hardlinks", "modes"}, where)
+    tree = Tree()
+    for p in _str_list(table.get("dirs", []), f"{where}.dirs"):
+        tree.add(Entry(p, "dir"))
+    for p in _str_list(table.get("files", []), f"{where}.files"):
+        tree.add(Entry(p, "file"))
+    for p, t in _str_map(table.get("symlinks", {}), f"{where}.symlinks").items():
+        if not t:
+            raise SpecError(f"empty symlink target for {p!r}")
+        tree.add(Entry(p, "symlink", t))
+    for p, t in _str_map(table.get("hardlinks", {}), f"{where}.hardlinks").items():
+        split_ref(t)
+        tree.add(Entry(p, "hardlink", t))
+    modes = table.get("modes", {})
+    if not isinstance(modes, dict) or not all(isinstance(m, int) for m in modes.values()):
+        raise SpecError(f"{where}.modes must map paths to integers")
+    for p, m in modes.items():
+        tree.set_mode(p, m)
+    return tree
+
+
+def parse_expect(table: dict, where: str) -> Expect:
+    _keys(table, {"result", "file", "errno"}, where)
+    result = table.get("result")
+    if result not in RESULTS:
+        raise SpecError(f"{where}.result must be one of {RESULTS}")
+    file, err = table.get("file"), table.get("errno")
+    if result == "ok":
+        if file is None or err is not None:
+            raise SpecError(f"{where}: result ok needs file and no errno")
+        check_entry_path(file)
+    elif result == "error":
+        if err is None or file is not None:
+            raise SpecError(f"{where}: result error needs errno and no file")
+        if not hasattr(errno_mod, err):
+            raise SpecError(f"{where}: unknown errno {err!r}")
+    elif file is not None or err is not None:
+        raise SpecError(f"{where}: result refused takes no file or errno")
+    return Expect(result, file, err)
+
+
+def parse_outcomes(table: dict, where: str) -> tuple[Expect, ...]:
+    """One outcome (result/file/errno), or several under accept = [...]."""
+    if "accept" not in table:
+        return (parse_expect(table, where),)
+    if set(table) != {"accept"}:
+        raise SpecError(f"{where}: accept cannot be mixed with result/file/errno")
+    alts = table["accept"]
+    if not isinstance(alts, list) or len(alts) < 2 or not all(isinstance(a, dict) for a in alts):
+        raise SpecError(f"{where}.accept must list at least two outcome tables")
+    out = tuple(parse_expect(a, f"{where}.accept[{i}]") for i, a in enumerate(alts))
+    if len(set(out)) != len(out):
+        raise SpecError(f"{where}.accept lists an outcome twice")
+    return out
+
+
+def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
+    """name is the fixture's identifier: its file name without .toml."""
+    _keys(
+        data,
+        {
+            "hazard",
+            "about",
+            "root_name",
+            "requires",
+            "root",
+            "outside",
+            "request",
+            "expect",
+        },
+        source,
+    )
+    for k in ("hazard", "about"):
+        if not isinstance(data.get(k), str) or not data[k]:
+            raise SpecError(f"{source}: {k} is required")
+    root_name = data.get("root_name", "root")
+    check_entry_path(root_name)
+    if "/" in root_name:
+        raise SpecError(f"{source}: root_name must be one component")
+    requires = tuple(_str_list(data.get("requires", []), "requires"))
+    for r in requires:
+        if r not in REQUIRES:
+            raise SpecError(f"{source}: unknown requirement {r!r}")
+    root = parse_tree(data.get("root", {}), "root")
+    outside = parse_tree(data.get("outside", {}), "outside")
+    if root_name in outside.entries or any(p.startswith(root_name + "/") for p in outside.entries):
+        raise SpecError(f"{source}: [outside] collides with root_name {root_name!r}")
+    for label, tree in (("root", root), ("outside", outside)):
+        for e in tree.entries.values():
+            if e.kind == "hardlink":
+                src_tree, src = split_ref(e.link)
+                src_entry = (root if src_tree == "root" else outside).entries.get(src)
+                if src_entry is None or src_entry.kind != "file":
+                    raise SpecError(f"{source}: hard link {label}:{e.path} needs a file {e.link!r}")
+    req = data.get("request")
+    if not isinstance(req, dict):
+        raise SpecError(f"{source}: [request] is required")
+    _keys(req, {"op", "path"}, "request")
+    if req.get("op") not in OPS or not isinstance(req.get("path"), str):
+        raise SpecError(f"{source}: request needs op in {OPS} and a path")
+    exp = data.get("expect")
+    if not isinstance(exp, dict):
+        raise SpecError(f"{source}: [expect] is required")
+    in_root_table = exp.get("in_root")
+    changes = tuple(_str_list(exp.get("outside_changes", []), "expect.outside_changes"))
+    for c in changes:
+        e = outside.entries.get(c)
+        if e is None or e.kind not in ("file", "hardlink"):
+            raise SpecError(f"{source}: outside_changes names {c!r}, not an [outside] file")
+    base = parse_outcomes(
+        {k: v for k, v in exp.items() if k not in ("in_root", "outside_changes")}, "expect"
+    )
+    in_root = parse_outcomes(in_root_table, "expect.in_root") if in_root_table else base
+    return Fixture(
+        name=name,
+        hazard=data["hazard"],
+        about=data["about"],
+        root_name=root_name,
+        requires=requires,
+        root=root,
+        outside=outside,
+        request=Request(req["op"], req["path"]),
+        expect=base,
+        expect_in_root=in_root,
+        outside_changes=changes,
+    )
+
+
+def load_fixture(path: str | Path) -> Fixture:
+    path = Path(path)
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    return parse_fixture(data, path.stem, str(path))
+
+
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
+
+
+def all_fixtures() -> list[Fixture]:
+    return [load_fixture(p) for p in sorted(FIXTURE_DIR.glob("*.toml"))]

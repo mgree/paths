@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.14"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # pyproject.toml points pyright at .venv, so CI uses one too.
+      - name: Install dev tools
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install --group dev
+
+      - name: Formatting
+        run: .venv/bin/ruff format --check .
+
+      - name: Type checking
+        run: .venv/bin/pyright
+
+      - name: Tests
+        run: .venv/bin/pytest -v

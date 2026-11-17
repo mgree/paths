@@ -1,0 +1,14 @@
+hazard = "Symlink escape"
+about = "Control: a relative symlink that stays inside the root must keep working. A strategy that refuses every symlink fails here."
+
+[root]
+files = ["real/f"]
+symlinks = { "link" = "real" }
+
+[request]
+op = "read"
+path = "link/f"
+
+[expect]
+result = "ok"
+file = "real/f"

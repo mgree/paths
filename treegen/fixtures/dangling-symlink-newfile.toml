@@ -1,0 +1,13 @@
+hazard = "Dangling symlinks"
+about = "newfile (O_EXCL) through a dangling symlink fails with EEXIST and creates nothing; O_EXCL is the mitigation, so even naive strategies pass."
+
+[root]
+symlinks = { "new" = "{sandbox}/created" }
+
+[request]
+op = "newfile"
+path = "new"
+
+[expect]
+result = "error"
+errno = "EEXIST"

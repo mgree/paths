@@ -1,0 +1,16 @@
+hazard = "Dangling symlinks"
+about = "write through a dangling relative symlink that climbs out: beneath refuses; in-root clamps .. at the root and creates the file inside."
+
+[root]
+symlinks = { "new" = "../created" }
+
+[request]
+op = "write"
+path = "new"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "ok"
+file = "created"

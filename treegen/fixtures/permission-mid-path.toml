@@ -1,0 +1,15 @@
+hazard = "Errors read as \"missing\""
+about = "A mode-000 directory mid-path is a permission error, not a missing file."
+requires = ["nonroot"]
+
+[root]
+files = ["locked/x"]
+modes = { "locked" = 0o000 }
+
+[request]
+op = "read"
+path = "locked/x"
+
+[expect]
+result = "error"
+errno = "EACCES"

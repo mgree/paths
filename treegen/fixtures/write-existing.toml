@@ -1,0 +1,13 @@
+hazard = "Symlink escape"
+about = "Control: write truncates an ordinary file inside the root. A strategy that refuses every write fails here."
+
+[root]
+files = ["f"]
+
+[request]
+op = "write"
+path = "f"
+
+[expect]
+result = "ok"
+file = "f"

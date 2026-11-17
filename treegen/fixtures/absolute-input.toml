@@ -1,0 +1,16 @@
+hazard = "Joining onto an absolute path"
+about = "An absolute request must not escape; IN_ROOT strategies re-anchor it."
+
+[root]
+files = ["etc/passwd"]
+
+[request]
+op = "read"
+path = "/etc/passwd"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "ok"
+file = "etc/passwd"

@@ -1,0 +1,20 @@
+hazard = "Comparing paths as strings"
+about = "A sibling whose name extends the root's name passes a string-prefix check."
+root_name = "foo"
+
+[root]
+files = ["x"]
+
+[outside]
+files = ["foobar/x"]
+
+[request]
+op = "read"
+path = "../foobar/x"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "error"
+errno = "ENOENT"

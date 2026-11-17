@@ -1,0 +1,14 @@
+hazard = "Symlink escape"
+about = "Control: write through a relative symlink that stays inside the root truncates its target."
+
+[root]
+files = ["real/f"]
+symlinks = { "link" = "real/f" }
+
+[request]
+op = "write"
+path = "link"
+
+[expect]
+result = "ok"
+file = "real/f"

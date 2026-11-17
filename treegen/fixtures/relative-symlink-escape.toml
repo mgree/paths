@@ -1,0 +1,19 @@
+hazard = "Symlink escape"
+about = "A relative symlink climbs out of the root with .."
+
+[root]
+symlinks = { "a/link" = "../../x" }
+
+[outside]
+files = ["x"]
+
+[request]
+op = "read"
+path = "a/link"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "error"
+errno = "ENOENT"
