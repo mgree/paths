@@ -217,11 +217,47 @@ RACE = {
             },
             "different filesystems",
         ),
+        (
+            # The outer mount is declared first, so a first match would put
+            # both files on it.
+            {
+                "root": {"files": ["ci/f", "ci/in/g"], "hardlinks": {"ci/in/h": "root:ci/f"}},
+                "mounts": [{"at": "ci", "type": "casefold"}, {"at": "ci/in", "type": "casefold"}],
+            },
+            "different filesystems",
+        ),
         ({**NS, "mounts": [{"at": "p", "type": "proc", "from": "root:p"}]}, "only bind"),
         ({**RACE, "race": {"exchange": ["root:f"]}}, "two entries"),
         ({**RACE, "race": {"exchange": ["root:f", "root:no"]}}, "root:no, which is not declared"),
         ({**RACE, "race": {"exchange": ["root:f", "root:f"]}}, "twice"),
         ({**RACE, "request": {"op": "newfile", "path": "f"}}, "cannot use newfile"),
+        (
+            {"root": {"files": ["d/f"]}, "race": {"exchange": ["root:d", "root:d/f"]}},
+            "one contains the other",
+        ),
+        (
+            {
+                "root": {"dirs": ["p", "q"]},
+                "mounts": [{"at": "p", "type": "proc"}],
+                "race": {"exchange": ["root:q", "root:p"]},
+            },
+            "one is a mount point",
+        ),
+        (
+            {
+                "root": {"files": ["ci/f", "g"]},
+                "mounts": [{"at": "ci", "type": "casefold"}],
+                "race": {"exchange": ["root:ci/f", "root:g"]},
+            },
+            "different filesystems",
+        ),
+        (
+            {
+                **RACE,
+                "expect": {"in_root": {"result": "error", "errno": "ENOENT"}, "result": "refused"},
+            },
+            "must accept EAGAIN",
+        ),
     ],
 )
 def test_spec_rejects(patch, msg):

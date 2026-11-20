@@ -33,11 +33,6 @@
 
 #include "strategy.h"
 
-// How often to look up the last component again when it changes between two
-// lookups (a symlink when opened, gone when read), before giving up with
-// EAGAIN. The same limit as openat2.c's.
-#define MAX_RETRIES 128
-
 static void *prepare(const char *path, enum semantics semantics) {
     struct root *root = malloc(sizeof *root);
     if (root == NULL) {

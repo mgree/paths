@@ -63,7 +63,8 @@ int main(int argc, char **argv) {
         usage();
     }
     unsigned limit = (unsigned)parse_decimal_long(argv[1], 1, INT_MAX);
-    int fd_a = (int)parse_decimal_long(argv[2], 0, INT_MAX), fd_b = (int)parse_decimal_long(argv[4], 0, INT_MAX);
+    int fd_a = (int)parse_decimal_long(argv[2], 0, INT_MAX);
+    int fd_b = (int)parse_decimal_long(argv[4], 0, INT_MAX);
     const char *a = parse_name(argv[3]), *b = parse_name(argv[5]);
     struct sigaction sa = {.sa_handler = on_term};
     if (sigaction(SIGTERM, &sa, NULL) < 0) {

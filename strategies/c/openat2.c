@@ -28,13 +28,10 @@
 #include "strategy.h"
 
 // The kernel fails a scoped lookup with EAGAIN when a rename or mount anywhere
-// on the system races with a `..` step, and the caller may retry. Retry up to
-// 128 times after the first attempt, as filepath-securejoin (used by runc) does:
-// https://github.com/cyphar/filepath-securejoin/blob/8096a959c5d7a248976a3531a030f5c4da0a44d0/pathrs-lite/internal/fd/openat2_linux.go#L35-L38
-// securejoin also retries EXDEV, which a race can cause when a directory on
-// the path is moved out of the root mid-lookup. We deliberately don't, so the
-// race fixtures can measure the difference.
-#define MAX_RETRIES 128
+// on the system races with a `..` step, and the caller may retry, up to
+// MAX_RETRIES times. filepath-securejoin also retries EXDEV, which a race can
+// cause when a directory on the path is moved out of the root mid-lookup. We
+// deliberately don't, so the race fixtures can measure the difference.
 
 struct openat2_state {
     struct root root;

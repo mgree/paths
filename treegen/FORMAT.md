@@ -56,8 +56,10 @@ result = "refused"                   # ok | refused | error
 # outside_changes = ["x"]            # [outside] files allowed to change; default none
 
 [expect.in_root]                     # optional override for RESOLVE_IN_ROOT-style
-result = "error"                     # strategies, which re-anchor absolute paths
-errno  = "ENOENT"
+accept = [                           # strategies, which re-anchor absolute paths
+  { result = "error", errno = "ENOENT" },
+  { result = "error", errno = "EAGAIN" },  # a race must accept EAGAIN
+]
 ```
 
 Fixture metadata:
@@ -130,7 +132,13 @@ both names always exist.
 
 - `exchange` names the two entries, each a declared entry in either tree,
   written `<tree>:<path>`. They may be of any kind, such as a file and a
-  symlink, or a directory and a symlink.
+  symlink, or a directory and a symlink. `renameat2` refuses some exchanges,
+  so neither entry may contain the other or be a mount point, and both must
+  be on the same filesystem (both inside one casefold mount, or both outside
+  any).
+- Both `[expect]` and `[expect.in_root]` must accept `EAGAIN`, either by name
+  or through `refused`. Races run side by side, and any rename on the system
+  can make a lookup with `..` give up with `EAGAIN`.
 - Every call must have an accepted outcome, and one call outside `[expect]`
   fails the strategy. So `[expect]` usually lists one outcome per position of
   the swap, with `accept`.

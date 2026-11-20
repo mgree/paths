@@ -20,6 +20,12 @@
 // The kernel's limit on symlinks followed in one lookup (MAXSYMLINKS).
 #define MAX_HOPS 40
 
+// How many times a strategy retries a lookup that a race spoiled, after the
+// first attempt, before giving up with EAGAIN. filepath-securejoin (used by
+// runc) retries 128 times:
+// https://github.com/cyphar/filepath-securejoin/blob/8096a959c5d7a248976a3531a030f5c4da0a44d0/pathrs-lite/internal/fd/openat2_linux.go#L35-L38
+#define MAX_RETRIES 128
+
 // What a strategy does with a path that would leave the root: BENEATH refuses
 // it, and IN_ROOT keeps it inside the root, as RESOLVE_BENEATH and
 // RESOLVE_IN_ROOT do. `list` prints these as the protocol's `beneath` and
