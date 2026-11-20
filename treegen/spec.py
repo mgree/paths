@@ -10,6 +10,7 @@ import errno as errno_mod
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal, get_args
 
 DIR_MODE = 0o755
 FILE_MODE = 0o644
@@ -20,8 +21,14 @@ REQUIRES = ("nonroot", "userns", "linux")
 # read: O_RDONLY, the file must exist. newfile: O_WRONLY|O_CREAT|O_EXCL, the
 # name must not exist. write: O_WRONLY|O_CREAT|O_TRUNC, as creat(2) and the
 # shell's > do. It creates or truncates the file, and follows a final symlink.
-OPS = ("read", "newfile", "write")
-RESULTS = ("ok", "refused", "error")
+Op = Literal["read", "newfile", "write"]
+OPS: tuple[Op, ...] = get_args(Op)
+ExpectedResult = Literal["ok", "refused", "error"]
+RESULTS: tuple[ExpectedResult, ...] = get_args(ExpectedResult)
+# Which expectations judge a strategy: beneath picks [expect], and in_root picks
+# [expect.in_root]. The driver protocol's `list` names each strategy's.
+Semantics = Literal["beneath", "in_root"]
+SEMANTICS: tuple[Semantics, ...] = get_args(Semantics)
 # bind: another declared directory's contents; proc: a procfs; casefold: an
 # empty case-insensitive tmpfs that the fixture's entries are built inside.
 MOUNT_TYPES = ("bind", "proc", "casefold")
@@ -95,13 +102,13 @@ class Tree:
 
 @dataclass(frozen=True)
 class Request:
-    op: str
+    op: Op
     path: str
 
 
 @dataclass(frozen=True)
 class Expect:
-    result: str
+    result: ExpectedResult
     file: str | None = None
     errno: str | None = None
 

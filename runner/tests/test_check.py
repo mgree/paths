@@ -15,11 +15,24 @@ FIXTURES = all_fixtures()
 
 
 @functools.cache
-def results() -> list[check.Result]:
-    """One run of the suite, shared by the tests that read it."""
+def shape_results() -> list[check.Result]:
+    """One run of the suite under every root shape, shared by the tests."""
     client.build(C)
-    tasks, unavailable = check.plan([C], FIXTURES, None, "/dev/shm", timeout=2)
+    tasks, unavailable = check.plan(
+        [C],
+        FIXTURES,
+        None,
+        "/dev/shm",
+        timeout=2,
+        valgrind=False,
+        root_shapes=tuple(check.RootShape),
+    )
     return [*check.run_all(tasks, jobs=16), *unavailable]
+
+
+def results() -> list[check.Result]:
+    """The results under the plain root."""
+    return [r for r in shape_results() if r.root_shape is check.RootShape.PLAIN]
 
 
 def verdicts(strategy: str) -> dict[str, check.Result]:
@@ -28,6 +41,12 @@ def verdicts(strategy: str) -> dict[str, check.Result]:
     found = {r.fixture: r for r in results() if r.strategy == strategy}
     assert len(found) == len(FIXTURES), f"{strategy} has results for {len(found)} fixtures"
     return found
+
+
+# The predictions below are made under the plain root only. That is enough,
+# because test_root_shape_changes_only_the_symlink_budget checks that every
+# other shape gives the same outcomes, apart from exceptions none of these
+# predictions involves.
 
 
 @pytest.mark.parametrize(
@@ -57,8 +76,10 @@ def test_string_concat_fails_every_refusal_fixture():
 
 def test_no_strategy_makes_the_driver_fail():
     """A crash, a sanitizer report or bad output is a bug in our code, whichever
-    strategy it happens in, including the ones no prediction covers."""
-    assert [(r.strategy, r.fixture) for r in check.driver_failures(results())] == []
+    strategy or root shape it happens under, including the strategies no
+    prediction covers."""
+    failures = check.driver_failures(shape_results())
+    assert [(r.root_shape, r.strategy, r.fixture) for r in failures] == []
 
 
 @pytest.mark.parametrize(
@@ -74,10 +95,33 @@ def test_runner_rejects_unknown_names(args, capsys):
     assert e.value.code == 2 and "unknown" in capsys.readouterr().err
 
 
+def outcome(r: check.Result):
+    a = r.attempt
+    return (r.verdict, a and (a.failure, a.ok, a.label, a.reached, a.outside_changed))
+
+
+def test_root_shape_changes_only_the_symlink_budget():
+    """The path to the root changes no outcome, with one exception. The kernel
+    counts the symlinks on the way to the root toward its limit of 40, so the
+    strategies that hand it root and request together have one hop fewer, and
+    the 40-link chain fails for them with ELOOP."""
+    plain = {(r.strategy, r.fixture): r for r in results()}
+    changed = {
+        (r.root_shape, r.strategy, r.fixture): r.reason
+        for r in shape_results()
+        if outcome(r) != outcome(plain[r.strategy, r.fixture])
+    }
+    assert changed == {
+        (shape, strategy, "symlink-chain-40"): "wanted ok, got error ELOOP"
+        for shape in (check.RootShape.SYMLINKED, check.RootShape.ROOT_IS_SYMLINK)
+        for strategy in ("string-concat", "logical")
+    }
+
+
 def test_nothing_is_skipped_where_mounts_work():
     if not ns.mounts_available():
         pytest.skip(ns.why_no_mounts() or "")
-    assert [r for r in results() if r.verdict == "skip"] == []
+    assert [r for r in shape_results() if r.verdict == "skip"] == []
 
 
 REFUSE = parse_fixture(

@@ -1,6 +1,7 @@
 """The correctness runner: every fixture against every available strategy.
 
     python -m runner.check [--driver c] [--strategy NAME ...] [--fixture NAME ...]
+                           [--root-shape SHAPE ... | --root-shape all]
 
 Each attempt gets a fresh sandbox (built inside a namespace when the fixture
 has mounts), an empty working directory outside the root, and a snapshot of
@@ -8,6 +9,9 @@ everything outside the root taken before and after the driver's one call. The
 attempt is judged against the fixture's expectations for the strategy's
 semantics, and recorded in full, outcome and all, so that a strategy's
 outcomes across the suite can be read as its fingerprint.
+
+The root's shape (see RootShape) spells the path to the root differently,
+as real configurations do, without changing what is inside it.
 
 Results go to results/raw/check-<start>.jsonl, with the start time in UTC. The
 first line says how the run was made, and each attempt's line is written as the
@@ -17,6 +21,7 @@ attempt finishes.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import itertools
 import json
@@ -30,7 +35,9 @@ from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from protocol import client
 from treegen import ns
@@ -43,7 +50,9 @@ from treegen.build import (
     scan,
     snapshot_outside,
 )
-from treegen.spec import Expect, Fixture, all_fixtures
+from treegen.spec import Expect, Fixture, Op, Semantics, all_fixtures
+
+Verdict = Literal["pass", "fail", "skip"]
 
 RESULTS = client.REPO / "results" / "raw"
 DEFAULT_BASE = Path("/dev/shm")
@@ -68,7 +77,8 @@ class Task:
     driver: str
     command: tuple[str, ...]  # exactly what runs, valgrind included
     strategy: str
-    semantics: str
+    semantics: Semantics
+    root_shape: RootShape
     base: str
     timeout: float
 
@@ -94,9 +104,10 @@ class Result:
     hazard: str
     driver: str
     strategy: str
-    semantics: str
-    op: str
-    verdict: str  # pass, fail, skip
+    semantics: Semantics
+    root_shape: RootShape
+    op: Op
+    verdict: Verdict
     reason: str
     attempt: Attempt | None
 
@@ -119,15 +130,46 @@ def _identity(sb: Sandbox, tree: str, rel: str) -> list[int] | None:
     return [st.st_dev, st.st_ino] if stat.S_ISREG(st.st_mode) else None
 
 
-def _working_dir(fx: Fixture, sb: Sandbox) -> Path:
-    """Make an empty directory in the sandbox, outside the root, with a name
-    that collides with nothing the fixture declares."""
-    name = "cwd"
+def _free_name(fx: Fixture, name: str) -> str:
+    """A name for a new entry in the sandbox, outside the root, that collides
+    with nothing the fixture declares."""
     while name in fx.outside.entries or name == fx.root_name:
         name = "_" + name
-    path = sb.path / name
+    return name
+
+
+def _working_dir(fx: Fixture, sb: Sandbox) -> Path:
+    """Make an empty directory in the sandbox, outside the root."""
+    path = sb.path / _free_name(fx, "cwd")
     os.mkdir(path, 0o755)
     return path
+
+
+class RootShape(StrEnum):
+    """How the runner spells the path to the root. Real configurations name
+    roots in all these ways, and a correct strategy behaves the same under
+    every one."""
+
+    PLAIN = "plain"
+    SYMLINKED = "symlinked"  # through a symlink to the directory above the root
+    DOTTED = "dotted"  # with `.`, `..` and `//`
+    ROOT_IS_SYMLINK = "root-is-symlink"
+
+    def path(self, sb: Sandbox, link: Path) -> str:
+        """Make any symlink this shape needs, at link beside the root, and
+        return the path to give the driver."""
+        root = sb.root.name
+        match self:
+            case RootShape.PLAIN:
+                return str(sb.root)
+            case RootShape.SYMLINKED:
+                os.symlink(".", link)
+                return str(link / root)
+            case RootShape.DOTTED:
+                return f"{sb.path}/.//{root}/../{root}"
+            case RootShape.ROOT_IS_SYMLINK:
+                os.symlink(root, link)
+                return str(link)
 
 
 def _changed(before: dict, after: dict) -> list[str]:
@@ -138,12 +180,13 @@ def _attempt_in_sandbox(task: Task) -> Attempt:
     fx = task.fixture
     with build_fixture(fx, task.base) as sb:
         cwd = _working_dir(fx, sb)
+        root = task.root_shape.path(sb, sb.path / _free_name(fx, "via"))
         before = snapshot_outside(sb)
         run = client.once(
             task.command,
             task.strategy,
             fx.request.op,
-            sb.root,
+            root,
             fx.request.path,
             cwd=cwd,
             timeout=task.timeout,
@@ -204,7 +247,7 @@ def _matches(e: Expect, a: Attempt) -> bool:
     return not a.ok and a.label is not None and client.same_error(a.label, e.errno or "")
 
 
-def judge(fx: Fixture, semantics: str, a: Attempt) -> tuple[str, str]:
+def judge(fx: Fixture, semantics: Semantics, a: Attempt) -> tuple[Verdict, str]:
     """The verdict, and a short reason such as "wanted refused, got ok outside"."""
     expects = fx.expect if semantics == "beneath" else fx.expect_in_root
     got = f"got {_got(a)}"
@@ -230,20 +273,22 @@ def skip_reason(fx: Fixture) -> str | None:
 
 def run_task(task: Task) -> Result:
     fx = task.fixture
-    base = dict(
+    result = functools.partial(
+        Result,
         fixture=fx.name,
         hazard=fx.hazard,
         driver=task.driver,
         strategy=task.strategy,
         semantics=task.semantics,
+        root_shape=task.root_shape,
         op=fx.request.op,
     )
     why = skip_reason(fx)
     if why:
-        return Result(**base, verdict="skip", reason=why, attempt=None)
+        return result(verdict="skip", reason=why, attempt=None)
     a = attempt(task)
     verdict, reason = judge(fx, task.semantics, a)
-    return Result(**base, verdict=verdict, reason=reason, attempt=a)
+    return result(verdict=verdict, reason=reason, attempt=a)
 
 
 # --- the suite -----------------------------------------------------------------
@@ -255,7 +300,9 @@ def plan(
     strategies: set[str] | None,
     base: str,
     timeout: float,
-    valgrind: bool = False,
+    *,
+    valgrind: bool,
+    root_shapes: tuple[RootShape, ...],
 ) -> tuple[list[Task], list[Result]]:
     """Return the attempts to make, and a result for each strategy this host
     can't run."""
@@ -268,16 +315,19 @@ def plan(
         for s in client.list_strategies(d.check_command):
             if strategies and s.name not in strategies:
                 continue
-            for fx in fixtures:
-                if s.unavailable:
-                    unavailable.append(
-                        Result(
-                            fx.name, fx.hazard, d.name, s.name, s.semantics, fx.request.op,
-                            "skip", f"unavailable: {s.unavailable}", None,
-                        )
-                    )  # fmt: skip
-                    continue
-                tasks.append(Task(fx, d.name, command, s.name, s.semantics, base, timeout))
+            for shape in root_shapes:
+                for fx in fixtures:
+                    if s.unavailable:
+                        unavailable.append(
+                            Result(
+                                fx.name, fx.hazard, d.name, s.name, s.semantics, shape,
+                                fx.request.op, "skip", f"unavailable: {s.unavailable}", None,
+                            )
+                        )  # fmt: skip
+                        continue
+                    tasks.append(
+                        Task(fx, d.name, command, s.name, s.semantics, shape, base, timeout)
+                    )
     return tasks, unavailable
 
 
@@ -333,16 +383,17 @@ def driver_failures(results: list[Result]) -> list[Result]:
 def report(results: list[Result]) -> str:
     """Per strategy: how many fixtures it passed, and what went wrong where."""
     lines = []
-    by_strategy: dict[tuple[str, str], list[Result]] = {}
+    by_strategy: dict[tuple[str, str, RootShape], list[Result]] = {}
     for r in results:
-        by_strategy.setdefault((r.driver, r.strategy), []).append(r)
+        by_strategy.setdefault((r.driver, r.strategy, r.root_shape), []).append(r)
     width = max((len(r.fixture) for r in results if r.verdict == "fail"), default=0)
-    for (d, s), rs in by_strategy.items():
+    for (d, s, shape), rs in by_strategy.items():
         judged = [r for r in rs if r.verdict != "skip"]
         passed = sum(r.verdict == "pass" for r in judged)
         skipped = len(rs) - len(judged)
         note = f", {skipped} skipped" if skipped else ""
-        lines.append(f"{d}/{s}: passes {passed}/{len(judged)}{note}")
+        label = f"{d}/{s}" if shape is RootShape.PLAIN else f"{d}/{s} (root shape: {shape})"
+        lines.append(f"{label}: passes {passed}/{len(judged)}{note}")
         for r in judged:
             if r.verdict == "fail":
                 lines.append(f"  {r.fixture:<{width}}  {r.reason}")
@@ -355,6 +406,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--driver", action="append", help="driver name (default: all that run here)")
     p.add_argument("--strategy", action="append", help="strategy name (default: all)")
     p.add_argument("--fixture", action="append", help="fixture name (default: all)")
+    p.add_argument(
+        "--root-shape",
+        action="append",
+        choices=[*RootShape, "all"],
+        help="how to spell the path to the root (default: plain)",
+    )
     p.add_argument("--timeout", type=float, default=5.0, help="seconds per attempt (default 5)")
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     p.add_argument("--base", default=str(DEFAULT_BASE), help="where sandboxes go")
@@ -392,8 +449,18 @@ def main(argv: list[str] | None = None) -> int:
     check_names("strategy", args.strategy, offered)
     strategies = set(args.strategy) if args.strategy else None
 
+    shapes = args.root_shape or [RootShape.PLAIN]
+    root_shapes = (
+        tuple(RootShape) if "all" in shapes else tuple(map(RootShape, dict.fromkeys(shapes)))
+    )
     tasks, unavailable = plan(
-        drivers, fixtures, strategies, args.base, args.timeout, valgrind=args.valgrind
+        drivers,
+        fixtures,
+        strategies,
+        args.base,
+        args.timeout,
+        valgrind=args.valgrind,
+        root_shapes=root_shapes,
     )
     out = args.out or RESULTS / f"check-{started:%Y%m%dT%H%M%SZ}.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)

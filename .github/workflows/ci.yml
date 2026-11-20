@@ -66,8 +66,8 @@ jobs:
 
       # Both exit 1 on a driver failure (a crash, a sanitizer or valgrind
       # report), which is a bug in our code; failed verdicts are findings.
-      - name: Correctness suite
-        run: .venv/bin/python -m runner.check --no-build
+      - name: Correctness suite, under every root shape
+        run: .venv/bin/python -m runner.check --no-build --root-shape all
 
       - name: Correctness suite under valgrind (descriptor and memory leaks)
         run: .venv/bin/python -m runner.check --no-build --valgrind

@@ -37,8 +37,10 @@ Arguments:
   Created files get mode `0644` exactly: drivers clear their umask.
   `race` and `time` do not take `newfile`, whose second call would fail with
   `EEXIST`.
-- `<root>` is the absolute path of the root. Before the first call, the driver
-  prepares whatever the strategy keeps (a root descriptor, a string).
+- `<root>` is the absolute path of the root. It need not be canonical: it may
+  pass through symlinks or contain `.`, `..` and `//`, as real configurations
+  do. Before the first call, the driver prepares whatever the strategy keeps
+  (a root descriptor, a string).
 - `<path>` is the request, raw bytes, handed to the strategy unchanged. It is
   always the last argument and never parsed as an option, so it may be empty,
   begin with `-`, or be absolute.

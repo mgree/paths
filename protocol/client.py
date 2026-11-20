@@ -14,11 +14,12 @@ import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
+
+from treegen.spec import SEMANTICS, Op, Semantics
 
 REPO = Path(__file__).resolve().parents[1]
 REGISTRY = Path(__file__).with_name("drivers.toml")
-
-SEMANTICS = ("beneath", "in_root")
 
 # The sys.platform values that Python documents. On other Unix systems, and on
 # FreeBSD before Python 3.14, the value has the OS's major version appended, so
@@ -98,7 +99,7 @@ def absolute(command: tuple[str, ...]) -> list[str]:
 @dataclass(frozen=True)
 class StrategyInfo:
     name: str
-    semantics: str
+    semantics: Semantics
     unavailable: str | None = None  # why this host cannot run it
 
 
@@ -149,8 +150,9 @@ _OK = re.compile(rf"OUTCOME {_NUM} ok")
 _ERROR = re.compile(rf"OUTCOME {_NUM} error (\S+)")
 _TIME = re.compile(rf"TIME {_NUM}")
 _HIST = re.compile(rf"HIST {_NUM} {_NUM}")
-_STRATEGY = re.compile(r"STRATEGY ([a-z0-9-]+) (beneath|in_root)")
-_UNAVAILABLE = re.compile(r"UNAVAILABLE ([a-z0-9-]+) (beneath|in_root) (.+)")
+_SEMANTICS = "|".join(SEMANTICS)
+_STRATEGY = re.compile(rf"STRATEGY ([a-z0-9-]+) ({_SEMANTICS})")
+_UNAVAILABLE = re.compile(rf"UNAVAILABLE ([a-z0-9-]+) ({_SEMANTICS}) (.+)")
 
 
 def parse_run(stdout: str, mode: str) -> Run:
@@ -197,9 +199,9 @@ def parse_list(stdout: str) -> list[StrategyInfo]:
     out = []
     for line in stdout.splitlines():
         if m := _STRATEGY.fullmatch(line):
-            out.append(StrategyInfo(m[1], m[2]))
+            out.append(StrategyInfo(m[1], cast(Semantics, m[2])))
         elif m := _UNAVAILABLE.fullmatch(line):
-            out.append(StrategyInfo(m[1], m[2], m[3]))
+            out.append(StrategyInfo(m[1], cast(Semantics, m[2]), m[3]))
         else:
             raise ProtocolError(f"unexpected line {line!r}")
     names = [s.name for s in out]
@@ -253,14 +255,14 @@ def invoke(
 def once(
     command: tuple[str, ...],
     strategy: str,
-    op: str,
-    root: Path,
+    op: Op,
+    root: str,  # passed as spelled: a Path would drop `.` and `//`
     path: str,
     *,
     cwd: Path,
     timeout: float,
 ) -> Run:
-    return invoke(command, "once", [strategy, op, str(root), path], cwd=cwd, timeout=timeout)
+    return invoke(command, "once", [strategy, op, root, path], cwd=cwd, timeout=timeout)
 
 
 def _text(b: bytes | str | None) -> str:

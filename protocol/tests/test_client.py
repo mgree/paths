@@ -103,6 +103,6 @@ def test_a_hang_is_a_timeout(tmp_path):
     with Sandbox(tmp_path) as sb:
         os.mkfifo(sb.root / "p")
         run = client.once(
-            c.check_command, "string-concat", "read", sb.root, "p", cwd=tmp_path, timeout=0.5
+            c.check_command, "string-concat", "read", str(sb.root), "p", cwd=tmp_path, timeout=0.5
         )
     assert run.failure == "timeout"
