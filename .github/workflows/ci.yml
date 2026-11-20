@@ -28,6 +28,9 @@ jobs:
       - name: Formatting
         run: .venv/bin/ruff format --check .
 
+      - name: Lint
+        run: .venv/bin/ruff check .
+
       - name: Type checking
         run: .venv/bin/pyright
 
@@ -40,5 +43,22 @@ jobs:
           fi
           .venv/bin/python -c "from treegen import ns; r = ns.why_no_mounts(); assert r is None, r"
 
+      # The sanitizer build crashes at startup when the kernel randomizes
+      # memory more than this GCC's AddressSanitizer expects. Valgrind is for
+      # the tests (which check it catches a leaked descriptor) and the last step.
+      - name: Build the C driver
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          sudo apt-get install -y valgrind
+          make -C strategies/c
+
       - name: Tests
         run: .venv/bin/pytest -v
+
+      # Both exit 1 on a driver failure (a crash, a sanitizer or valgrind
+      # report), which is a bug in our code; failed verdicts are findings.
+      - name: Correctness suite
+        run: .venv/bin/python -m runner.check --no-build
+
+      - name: Correctness suite under valgrind (descriptor and memory leaks)
+        run: .venv/bin/python -m runner.check --no-build --valgrind

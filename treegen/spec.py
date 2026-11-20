@@ -18,14 +18,15 @@ KINDS = ("dir", "file", "fifo", "symlink", "hardlink")
 TREES = ("root", "outside")
 REQUIRES = ("nonroot", "userns", "linux")
 # read: O_RDONLY, the file must exist. newfile: O_WRONLY|O_CREAT|O_EXCL, the
-# name must not exist. write: O_WRONLY|O_CREAT|O_TRUNC, what creat(2) and a
-# shell ">" do: creates or truncates, and follows a final symlink.
+# name must not exist. write: O_WRONLY|O_CREAT|O_TRUNC, as creat(2) and the
+# shell's > do. It creates or truncates the file, and follows a final symlink.
 OPS = ("read", "newfile", "write")
 RESULTS = ("ok", "refused", "error")
 # bind: another declared directory's contents; proc: a procfs; casefold: an
 # empty case-insensitive tmpfs that the fixture's entries are built inside.
 MOUNT_TYPES = ("bind", "proc", "casefold")
-# What [[mounts]] implies: we can only mount unprivileged in a Linux user namespace.
+# The requirements [[mounts]] implies: an unprivileged process can mount only
+# inside a Linux user namespace.
 MOUNT_REQUIRES = ("userns", "linux")
 
 
@@ -139,7 +140,8 @@ def check_entry_path(path: str) -> None:
 
 
 def split_ref(text: str) -> tuple[str, str]:
-    """A file named as <tree>:<path>, tree being root or outside."""
+    """Parse a file reference of the form <tree>:<path>, where tree is root or
+    outside."""
     tree, sep, path = text.partition(":")
     if not sep or tree not in TREES:
         raise SpecError(f"{text!r} must be root:<path> or outside:<path>")
@@ -210,7 +212,8 @@ def parse_expect(table: dict, where: str) -> Expect:
 
 
 def parse_outcomes(table: dict, where: str) -> tuple[Expect, ...]:
-    """One outcome (result/file/errno), or several under accept = [...]."""
+    """Parse the expected outcome: one outcome (result, file, errno), or
+    several under accept = [...]."""
     if "accept" not in table:
         return (parse_expect(table, where),)
     if set(table) != {"accept"}:
@@ -225,9 +228,10 @@ def parse_outcomes(table: dict, where: str) -> tuple[Expect, ...]:
 
 
 def _check_hardlinks(root: Tree, outside: Tree, source: str) -> None:
-    """Each hard link names a declared file. A link and its source are one
-    file with one mode, so a mode may be written on any of them; it is copied
-    to all, and two different modes for one file are an error."""
+    """Check that each hard link names a declared file. A link and its source
+    are one file with one mode, so a fixture may give the mode on any of its
+    names. The mode is copied to all of them, and two different modes for one
+    file are an error."""
     trees = {"root": root, "outside": outside}
     names: dict[tuple[str, str], list[tuple[str, str]]] = {}  # source -> its names
     for label, tree in trees.items():

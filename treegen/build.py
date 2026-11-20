@@ -22,7 +22,8 @@ from .spec import Entry, Fixture, Tree, split_ref
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
-# O_NONBLOCK: a FIFO opens at once instead of waiting for a writer (we refuse it after).
+# With O_NONBLOCK, opening a FIFO returns at once instead of waiting for a
+# writer. read_unlocked then refuses it.
 READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 
 
@@ -43,7 +44,9 @@ class Sandbox:
         os.chmod(self.root, 0o755)
 
     def remove(self) -> None:
-        for at in reversed(list(self.mounts)):  # unmount first: never delete through one
+        # Unmount first, so that removing the sandbox never deletes through a
+        # mount into its source.
+        for at in reversed(list(self.mounts)):
             ns.umount(self.root / at)
         self.mounts.clear()
         _make_traversable(self.path)
@@ -84,8 +87,8 @@ def open_dir(base_fd: int, rel: str) -> Generator[int]:
 
 
 def _unlock(stack: ExitStack, dir_fd: int, name: str, need: int, grant: int) -> None:
-    """If name lacks the owner bits in need, add grant, and have stack restore
-    the old mode on exit."""
+    """If name lacks any of the owner bits in `need`, add the bits in `grant`,
+    and have `stack` restore the old mode on exit."""
     mode = stat.S_IMODE(os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode)
     if mode & need != need:
         os.chmod(name, mode | grant, dir_fd=dir_fd)
@@ -113,7 +116,8 @@ def _split(path: str) -> tuple[str, str]:
 
 
 def _file_contents(fixture: str, tree: str, path: str) -> bytes:
-    """One line, unique across the suite: '<fixture> <tree>:<path>'."""
+    """The contents of each regular file: one line, '<fixture> <tree>:<path>',
+    which is unique across the suite."""
     return f"{fixture} {tree}:{path}\n".encode()
 
 
@@ -156,7 +160,8 @@ def _create(fds: dict[str, int], label: str, e: Entry, fixture: str, sb: Sandbox
 def _mount_casefold(root_fd: int, at: str, sb: Sandbox) -> None:
     ns.mount("tmpfs", sb.root / at, "tmpfs", 0, ns.CASEFOLD_OPTIONS)
     sb.mounts[at] = "casefold"
-    with open_dir(root_fd, at) as fd:  # opened after mounting: the tmpfs's top
+    # Open it after mounting, so the descriptor is the tmpfs's top directory.
+    with open_dir(root_fd, at) as fd:
         ns.set_casefold(fd)
 
 
@@ -171,12 +176,13 @@ def _mount_late(fx: Fixture, sb: Sandbox) -> None:
             ns.mount((sb.root if tree == "root" else sb.path) / path, target, None, ns.MS_BIND)
         elif m.type == "proc":
             ns.mount("proc", target, "proc")
-        if m.type != "casefold":  # casefold went on during the build
+        if m.type != "casefold":  # casefold mounts were already made during the build
             sb.mounts[m.at] = m.type
 
 
 def _apply_modes(base_fd: int, tree: Tree) -> None:
-    """chmod every non-symlink entry, deepest first, so a 000 directory is last."""
+    """chmod every entry except symlinks, deepest first, so that no directory
+    loses its permissions before the entries under it are done."""
     for e in sorted(tree.entries.values(), key=lambda e: -e.path.count("/")):
         mode = e.effective_mode()
         if mode is None or e.kind == "hardlink":
@@ -196,7 +202,8 @@ def build_fixture(fx: Fixture, base: str | Path | None = None) -> Sandbox:
             _apply_modes(top, fx.outside)
             _apply_modes(root, fx.root)
         _mount_late(fx, sb)
-        stack.pop_all()  # success: keep the sandbox, now the caller's
+        # The build succeeded, so keep the sandbox. The caller owns it now.
+        stack.pop_all()
         return sb
 
 
@@ -239,7 +246,7 @@ def _scan_dir(fd: int, prefix: str, sb: Sandbox, records: list[Record]) -> None:
             records.append(Record(tree, path, "symlink", None, os.readlink(name, dir_fd=fd), ino))
         elif stat.S_ISREG(st.st_mode):
             records.append(Record(tree, path, "file", mode, None, ino))
-        elif stat.S_ISFIFO(st.st_mode):  # never opened: an open would block
+        elif stat.S_ISFIFO(st.st_mode):  # don't open it: opening a FIFO would block
             records.append(Record(tree, path, "fifo", mode, None, ino))
         elif mount in ("bind", "proc"):
             records.append(Record(tree, path, mount, mode, None, ino))
@@ -254,16 +261,26 @@ def _scan_dir(fd: int, prefix: str, sb: Sandbox, records: list[Record]) -> None:
             raise ValueError(f"unexpected file type at {rel!r}: {st.st_mode:o}")
 
 
-def snapshot_outside(sb: Sandbox) -> dict[str, tuple]:
-    """Everything outside the root that a strategy could change: per entry its
-    kind, mode, link text, identity and, for regular files, contents (only
-    those are read: opening a FIFO blocks). Compare before and after."""
-    snap: dict[str, tuple] = {}
+@dataclass(frozen=True)
+class OutsideEntry:
+    """One entry outside the root, as a snapshot sees it."""
+
+    kind: str
+    mode: int | None
+    target: str | None  # symlink text
+    ino: tuple[int, int]
+    data: bytes | None  # contents, for regular files only (opening a FIFO blocks)
+
+
+def snapshot_outside(sb: Sandbox) -> dict[str, OutsideEntry]:
+    """Everything outside the root that a strategy could change, keyed by
+    sandbox-relative path. Compare a snapshot from before with one from after."""
+    snap: dict[str, OutsideEntry] = {}
     for r in scan(sb):
         if r.tree != "outside":
             continue
         data = read_unlocked(sb.path, r.path) if r.kind == "file" else None
-        snap[r.path] = (r.kind, r.mode, r.target, r.ino, data)
+        snap[r.path] = OutsideEntry(r.kind, r.mode, r.target, r.ino, data)
     return snap
 
 
@@ -271,7 +288,8 @@ def read_unlocked(top: Path, rel: str) -> bytes:
     """Read a regular file even under mode-000 directories, restoring their
     modes. Anything else is refused without blocking."""
     head, name = _split(rel)
-    with ExitStack() as stack:  # unwinds innermost first: close, then restore
+    # The stack unwinds innermost first: it closes the file, then restores the modes.
+    with ExitStack() as stack:
         fd = stack.enter_context(opened(top, DIR_FLAGS))
         for part in head.split("/") if head else []:
             _unlock(stack, fd, part, 0o500, 0o700)

@@ -2,7 +2,6 @@
 
 import os
 import signal
-import stat
 import tomllib
 from contextlib import contextmanager
 from pathlib import Path
@@ -77,8 +76,10 @@ def in_sandbox(fx: Fixture, base: Path, fn):
     return ns.run_in_namespace(go)
 
 
-def test_fixture_dir_nonempty():
-    assert len(FIXTURES) == len(list(FIXTURE_DIR.glob("*.toml"))) > 0
+def test_fixtures_were_found():
+    """Every fixture test is parametrized over FIXTURES: with none found, they
+    would all silently vanish instead of failing."""
+    assert FIXTURES
 
 
 @pytest.mark.parametrize("base", BASES.values(), ids=BASES.keys())
@@ -237,8 +238,9 @@ DEEP = "/".join(["d" * 200] * 25)  # about 5,000 bytes, past PATH_MAX
     ids=["outside-link-to-root-file", "link-source-past-path-max", "mode-on-link"],
 )
 def test_hard_links_build_as_declared(trees, base):
-    """Link cases no committed fixture has: a source in the other tree, built
-    second, and a source path too long to name in one string."""
+    """Hard-link cases that no committed fixture covers: a source in the other
+    tree, which is built second, and a source path too long to name in one
+    string."""
     fx = parse_fixture({**MINIMAL, **trees}, "t")
     base.mkdir(parents=True, exist_ok=True)
     in_sandbox(fx, base, check_build)
@@ -259,17 +261,12 @@ def test_fixture_files_are_ascii():
         assert p.read_bytes().isascii(), f"{p.name}: write non-ASCII characters as escapes"
 
 
-def test_every_file_parses_as_toml():
-    for p in FIXTURE_DIR.glob("*.toml"):
-        with p.open("rb") as f:
-            tomllib.load(f)
-
-
 def test_file_contents_identify_the_file(tmp_path):
     """Every regular file holds '<fixture> <tree>:<path>', distinct across the suite."""
 
     def contents(fx, sb):
-        """Per file (hard links are one file): its names, and what it holds."""
+        """Map each file to its names and its contents. Hard links to one file
+        count as one file."""
         files: dict[tuple[int, int], tuple[list[str], bytes]] = {}
         for r in scan(sb):
             if r.kind == "file":
@@ -314,7 +311,7 @@ def test_snapshot_outside_is_stable_and_restores_modes(tmp_path):
     fx = parse_fixture(SNAPSHOT_FX, "snap")
     with build_fixture(fx, tmp_path) as sb:
         before = snapshot_outside(sb)
-        assert before["locked/inner"][4] == b"snap outside:locked/inner\n"
+        assert before["locked/inner"].data == b"snap outside:locked/inner\n"
         assert snapshot_outside(sb) == before
         check_build(fx, sb)  # modes put back
 
@@ -368,8 +365,8 @@ def test_fifos_are_never_opened(tmp_path):
         with build_fixture(fx, tmp_path) as sb:
             check_build(fx, sb)
             snap = snapshot_outside(sb)
-            assert snap["q"][0] == "fifo" and snap["q"][4] is None
-            assert snap["f"][4] == b"t outside:f\n"
+            assert snap["q"].kind == "fifo" and snap["q"].data is None
+            assert snap["f"].data == b"t outside:f\n"
             with pytest.raises(ValueError, match="not a regular file"):
                 read_unlocked(sb.path, "q")
 
@@ -407,12 +404,3 @@ def test_scan_and_snapshot_close_their_descriptors(tmp_path):
         scan(sb)
         snapshot_outside(sb)
         assert _open_fds() == fds
-
-
-def test_mode_on_a_hard_link_reaches_the_file(tmp_path):
-    trees = {
-        "root": {"files": ["f"]},
-        "outside": {"hardlinks": {"h": "root:f"}, "modes": {"h": 0o600}},
-    }
-    with build_fixture(parse_fixture({**MINIMAL, **trees}, "t"), tmp_path) as sb:
-        assert stat.S_IMODE(os.stat(sb.root / "f").st_mode) == 0o600

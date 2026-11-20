@@ -29,7 +29,8 @@ def test_exceptions_come_back_with_their_traceback():
 @needs_mounts
 @pytest.mark.skipif(os.getuid() == 0, reason="root bypasses permission checks anyway")
 def test_programs_run_inside_keep_permission_checks(tmp_path):
-    """Not mapped to root, so an exec'd strategy still gets EACCES."""
+    """The namespace maps our uid to itself, not to root, so a program run
+    inside it still gets EACCES."""
     locked = tmp_path / "locked"
     locked.mkdir()
     locked.chmod(0)
@@ -48,23 +49,6 @@ def test_mounts_stay_inside(tmp_path):
     dev = ns.run_in_namespace(lambda: (ns.mount("tmpfs", target, "tmpfs"), target.stat().st_dev))
     assert dev[1] != tmp_path.stat().st_dev  # mounted in there
     assert target.stat().st_dev == tmp_path.stat().st_dev  # not out here
-
-
-@pytest.mark.skipif(sys.platform != "linux", reason="the switches are Linux sysctls")
-@pytest.mark.parametrize(
-    "sysctls, hint",
-    [
-        (
-            {"kernel.apparmor_restrict_unprivileged_userns": "1"},
-            "apparmor_restrict_unprivileged_userns=0",
-        ),
-        ({"kernel.unprivileged_userns_clone": "0"}, "unprivileged_userns_clone=1"),
-        ({"user.max_user_namespaces": "0"}, "max_user_namespaces=15000"),
-    ],
-)
-def test_blocking_switch_is_named_with_its_fix(sysctls, hint):
-    blocker = ns.known_blocker(sysctls.get)
-    assert blocker is not None and hint in blocker
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="the switches are Linux sysctls")

@@ -11,15 +11,20 @@ dependencies = []
 dev = ["pytest==9.2.0", "ruff==0.17.5", "pyright==1.1.414"]  # pinned: formatter output changes between releases
 
 [tool.pytest.ini_options]
-testpaths = ["treegen/tests"]
+testpaths = ["treegen/tests", "protocol/tests", "runner/tests"]
 pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
+[tool.ruff.lint]
+# ruff's defaults (syntax errors, undefined and unused names) plus bugbear's
+# likely-bug patterns.
+select = ["E4", "E7", "E9", "F", "B"]
+
 [tool.pyright]
-include = ["treegen", "tools"]
+include = ["treegen", "tools", "protocol", "runner"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 reportDeprecated = "error"

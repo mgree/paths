@@ -131,6 +131,38 @@ UNAVAILABLE <name> <semantics> <reason>
 - For fixtures with mounts, the runner starts the driver inside the fixture's
   namespace. Nothing changes for the driver.
 
+## Registering a driver
+
+The runner and the harness find drivers in `protocol/drivers.toml`, which has
+one table per driver, named after its language:
+
+```toml
+[c]
+build = ["make", "-C", "strategies/c"]
+command = ["strategies/c/build/driver"]
+check_command = ["strategies/c/build/driver-check"]
+platforms = ["linux"]
+```
+
+- `command` is the `DRIVER` command that the benchmark harness times. A
+  program written with a `/` is relative to the repository root. A bare name,
+  such as `python3`, is looked up on `PATH`.
+- `check_command` (optional) is the command the correctness runner uses. It is
+  meant for a build with extra checking, such as sanitizers, and defaults to
+  `command`. Both commands must follow this protocol.
+- `build` (optional) runs from the repository root before the driver is used.
+  It should do nothing when the build is up to date, because the runner and
+  the tests run it often.
+- `platforms` lists the values of Python's
+  [`sys.platform`](https://docs.python.org/3/library/sys.html#sys.platform)
+  that the driver runs on, such as `linux` or `darwin`. On any other host, the
+  driver is skipped.
+  + A name must be one in that table: a driver listing `macos` or `windows`
+    would never run, so the runner rejects it.
+  + A host matches a name if its `sys.platform` starts with that name,
+    because some systems append their major version (FreeBSD reports
+    `freebsd14` before Python 3.14).
+
 ## Not yet specified
 
 Threads, retry counts (`openat2`'s `EAGAIN`), `newfile` in loops, and requests

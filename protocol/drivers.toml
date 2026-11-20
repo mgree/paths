@@ -1,0 +1,8 @@
+# The drivers the correctness runner and the benchmark harness can invoke, one
+# table per language. "Registering a driver" in PROTOCOL.md explains the keys.
+
+[c]
+build = ["make", "-C", "strategies/c"]
+command = ["strategies/c/build/driver"]              # optimized, for timing
+check_command = ["strategies/c/build/driver-check"]  # sanitizers on, for correctness
+platforms = ["linux"]

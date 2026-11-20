@@ -35,8 +35,9 @@ class Stats:
 
 
 def relation(link_dir: str, target: str) -> tuple[str, int, int]:
-    """Lexical relation of a target (relative to the top, normalized) to the
-    link's directory: (name, up, down)."""
+    """Describe how a target relates to the link's directory, comparing paths
+    as strings: (name, up, down). The target is relative to the top and
+    normalized."""
     a = [p for p in link_dir.split("/") if p]
     b = [p for p in target.split("/") if p]
     common = 0
@@ -59,8 +60,9 @@ def relation(link_dir: str, target: str) -> tuple[str, int, int]:
 
 
 def classify(st: Stats, link_rel: str, text: str, top_abs: str | None) -> str | None:
-    """Record the text-only properties; return the target relative to the
-    top (logically normalized), or None when it is outside the tree."""
+    """Record the properties that depend only on the link's text. Return the
+    target relative to the top, logically normalized, or None if it is outside
+    the tree."""
     st.n += 1
     link_dir = posixpath.dirname(link_rel)
     parts = [p for p in text.split("/") if p not in ("", ".")]

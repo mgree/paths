@@ -110,7 +110,8 @@ def _child(w: int, fn: Callable, args: tuple) -> None:
         Path("/proc/self/setgroups").write_text("deny")
         Path("/proc/self/uid_map").write_text(f"{uid} {uid} 1")
         Path("/proc/self/gid_map").write_text(f"{gid} {gid} 1")
-        mount(None, "/", None, MS_REC | MS_PRIVATE)  # nothing propagates out
+        # Make every mount private, so nothing mounted here propagates to the host.
+        mount(None, "/", None, MS_REC | MS_PRIVATE)
         pid = os.fork()  # the grandchild is PID 1 of the new PID namespace
         if pid == 0:
             try:
@@ -179,8 +180,9 @@ def _read_sysctl(name: str) -> str | None:
 
 
 def known_blocker(read_sysctl: Callable[[str], str | None] = _read_sysctl) -> str | None:
-    """A reason mounting cannot work that is visible without trying, with the
-    fix where there is one; None if nothing rules it out."""
+    """Return a reason that mounting can't work, if one is visible without
+    trying, along with its fix if there is one. Return None if nothing rules
+    mounting out."""
     if sys.platform != "linux":
         return "user namespaces are Linux-only"
     if not Path("/proc/self/ns/user").exists():
@@ -196,9 +198,9 @@ def known_blocker(read_sysctl: Callable[[str], str | None] = _read_sysctl) -> st
 
 @cache
 def why_no_mounts() -> str | None:
-    """None if this host lets an unprivileged process mount in a user namespace;
-    otherwise why not. Known blockers are checked first; only if none applies
-    do we try."""
+    """Return None if this host lets an unprivileged process mount in a user
+    namespace, or the reason it doesn't. The known blockers are checked first,
+    and mounting is tried only if none of them applies."""
     blocker = known_blocker()
     if blocker is not None:
         return blocker
