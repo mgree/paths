@@ -18,12 +18,33 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Valgrind is for the tests (which check it catches a leaked descriptor)
+      # and the last step. The runner image already has gcc and clang.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y valgrind
+
+      # Ubuntu's AppArmor default lets unprivileged processes create user
+      # namespaces but not mount in them; the mount fixtures need both. The
+      # sanitizer build crashes at startup when the kernel randomizes memory
+      # more than this GCC's AddressSanitizer expects.
+      - name: Configure the kernel
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          sudo sysctl -w vm.mmap_rnd_bits=28
+
       # pyproject.toml points pyright at .venv, so CI uses one too.
       - name: Install dev tools
         run: |
           python -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install --group dev
+
+      - name: Check that mounts work
+        run: .venv/bin/python -c "from treegen import ns; r = ns.why_no_mounts(); assert r is None, r"
 
       - name: Formatting
         run: .venv/bin/ruff format --check .
@@ -34,23 +55,11 @@ jobs:
       - name: Type checking
         run: .venv/bin/pyright
 
-      # Ubuntu's AppArmor default lets unprivileged processes create user
-      # namespaces but not mount in them; the mount fixtures need both.
-      - name: Allow mounts in unprivileged user namespaces
-        run: |
-          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          .venv/bin/python -c "from treegen import ns; r = ns.why_no_mounts(); assert r is None, r"
-
-      # The sanitizer build crashes at startup when the kernel randomizes
-      # memory more than this GCC's AddressSanitizer expects. Valgrind is for
-      # the tests (which check it catches a leaked descriptor) and the last step.
       - name: Build the C driver
-        run: |
-          sudo sysctl -w vm.mmap_rnd_bits=28
-          sudo apt-get install -y valgrind
-          make -C strategies/c
+        run: make -C strategies/c
+
+      - name: Static analysis of the C driver
+        run: make -C strategies/c analyze
 
       - name: Tests
         run: .venv/bin/pytest -v
