@@ -68,6 +68,20 @@ def test_pure_openat2_fails_only_past_path_max(strategy):
     assert all(r.reason == "wanted ok, got error ENAMETOOLONG" for r in failed.values())
 
 
+@pytest.mark.parametrize(
+    "strategy",
+    ["openat2-beneath", "openat2-in-root", "openat2-walk-beneath", "openat2-walk-in-root"],
+)
+def test_moving_a_directory_out_of_the_root_gives_openat2_exdev(strategy):
+    """swap-race-dir-out-of-root exists to count the EXDEVs openat2 gives when
+    a directory on the path moves out of the root mid-lookup. Its expectations
+    accept EXDEV without requiring it, so this checks that the race really
+    produces some."""
+    attempt = verdicts(strategy)["swap-race-dir-out-of-root"].attempt
+    assert attempt is not None
+    assert any(o.label == "EXDEV" for o in attempt.outcomes)
+
+
 def test_string_concat_fails_every_refusal_fixture():
     """The negative control for the fixtures. string-concat checks nothing, so
     it must fail every fixture that accepts only a refusal. If it passes one,
@@ -165,7 +179,7 @@ def test_a_driver_failure_is_never_a_refusal(failure):
 
 def test_any_change_outside_fails_even_a_matching_outcome():
     verdict, reason = check.judge(REFUSE, "beneath", attempt(outside_changed=["secret"]))
-    assert verdict == "fail" and "wrote outside" in reason
+    assert verdict == "fail" and reason == "wrote outside: secret"
 
 
 def test_one_bad_call_fails_a_race():

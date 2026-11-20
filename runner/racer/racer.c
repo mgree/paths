@@ -6,7 +6,8 @@
 // passed as a descriptor, so no path the racer uses can exceed PATH_MAX. The
 // runner runs it while a driver is in race mode, and stops it when the driver
 // is done. The exchange is atomic, so at every moment both names exist, each
-// naming one of the two entries.
+// naming one of the two entries. The racer stops only after an even number of
+// swaps, so it leaves the tree as it found it.
 //
 // To run it by hand, let the shell open the directories:
 //
@@ -71,7 +72,7 @@ int main(int argc, char **argv) {
     }
     alarm(limit);
     unsigned long long swaps = 0;
-    while (!stop) {
+    while (!stop || swaps % 2 != 0) {
         if (renameat2(fd_a, a, fd_b, b, RENAME_EXCHANGE) < 0) {
             fprintf(stderr, "racer: exchanging %s and %s: %s\n", a, b, strerror(errno));
             return 1;

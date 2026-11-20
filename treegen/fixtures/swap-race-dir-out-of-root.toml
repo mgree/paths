@@ -1,0 +1,32 @@
+hazard = "TOCTOU"
+about = """A directory on the path and an empty directory outside trade places, over and \
+over, while the strategy reads d/a/b/f. No symlink leads out and the request has no .., \
+so nothing can reach outside the root: every call should open the root's f, or fail \
+with ENOENT when d is the empty directory. But if d moves out while a lookup is below \
+it, openat2 finds f outside the root and refuses with EXDEV, though nothing tried to \
+escape. This fixture counts how often that happens."""
+
+[root]
+dirs = ["d", "d/a", "d/a/b"]
+files = ["d/a/b/f"]
+
+[outside]
+dirs = ["away"]
+
+[race]
+exchange = ["root:d", "outside:away"]
+
+[request]
+op = "read"
+path = "d/a/b/f"
+
+[expect]
+accept = [{ result = "ok", file = "d/a/b/f" }, { result = "refused" }]
+
+[expect.in_root]
+accept = [
+  { result = "ok", file = "d/a/b/f" },
+  { result = "error", errno = "ENOENT" },
+  { result = "error", errno = "EAGAIN" },
+  { result = "error", errno = "EXDEV" },
+]

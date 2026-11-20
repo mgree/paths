@@ -1,4 +1,4 @@
-hazard = "Symlink race"
+hazard = "TOCTOU"
 about = """A file and a symlink to outside trade places, over and over, while the strategy \
 reads the file's name. Every call must open the file or refuse. A strategy that checks \
 the path and then looks it up again can be caught between the two, and read outside. \

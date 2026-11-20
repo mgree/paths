@@ -327,11 +327,12 @@ def judge(fx: Fixture, semantics: Semantics, a: Attempt) -> tuple[Verdict, str]:
         return _got(o) if calls == 1 else f"{_got(o)} ({o.count} of {calls} calls)"
 
     bad = [o for o in a.outcomes if not any(_matches(e, a, o) for e in expects)]
-    shown = bad[0] if bad else a.outcomes[0]
-    if any(p not in fx.outside_changes for p in a.outside_changed):
-        return "fail", f"{wanted}, got {got(shown)}, wrote outside"
-    if bad:
-        return "fail", f"{wanted}, got {got(shown)}"
+    wrote = [p for p in a.outside_changed if p not in fx.outside_changes]
+    reasons = [f"{wanted}, got {got(bad[0])}"] if bad else []
+    if wrote:
+        reasons.append(f"wrote outside: {', '.join(wrote)}")
+    if reasons:
+        return "fail", ", ".join(reasons)
     return "pass", "got " + ", ".join(got(o) for o in a.outcomes)
 
 

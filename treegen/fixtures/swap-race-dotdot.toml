@@ -1,4 +1,4 @@
-hazard = "Symlink race"
+hazard = "TOCTOU"
 about = """A directory and a symlink to a directory outside trade places, over and over, \
 while the strategy reads d/../x. If d is the symlink when the lookup reaches it, `..` \
 climbs from outside, and x there is a different file. A strategy must never read it. \
