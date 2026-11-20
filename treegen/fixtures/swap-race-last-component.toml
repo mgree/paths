@@ -1,0 +1,29 @@
+hazard = "Symlink race"
+about = """A file and a symlink to outside trade places, over and over, while the strategy \
+reads the file's name. Every call must open the file or refuse. A strategy that checks \
+the path and then looks it up again can be caught between the two, and read outside. \
+EAGAIN, giving up under the race, is accepted: it costs availability, not safety."""
+
+[root]
+files = ["f"]
+symlinks = { "f-link" = "{sandbox}/secret" }
+
+[outside]
+files = ["secret"]
+
+[race]
+exchange = ["root:f", "root:f-link"]
+
+[request]
+op = "read"
+path = "f"
+
+[expect]
+accept = [{ result = "ok", file = "f" }, { result = "refused" }]
+
+[expect.in_root]
+accept = [
+  { result = "ok", file = "f" },
+  { result = "error", errno = "ENOENT" },
+  { result = "error", errno = "EAGAIN" },
+]

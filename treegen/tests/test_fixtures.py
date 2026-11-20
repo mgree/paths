@@ -140,6 +140,10 @@ MINIMAL = {
 
 
 NS = {"root": {"dirs": ["p"]}}
+RACE = {
+    "root": {"files": ["f"], "symlinks": {"l": "f"}},
+    "race": {"exchange": ["root:f", "root:l"]},
+}
 
 
 @pytest.mark.parametrize(
@@ -214,6 +218,10 @@ NS = {"root": {"dirs": ["p"]}}
             "different filesystems",
         ),
         ({**NS, "mounts": [{"at": "p", "type": "proc", "from": "root:p"}]}, "only bind"),
+        ({**RACE, "race": {"exchange": ["root:f"]}}, "two entries"),
+        ({**RACE, "race": {"exchange": ["root:f", "root:no"]}}, "root:no, which is not declared"),
+        ({**RACE, "race": {"exchange": ["root:f", "root:f"]}}, "twice"),
+        ({**RACE, "request": {"op": "newfile", "path": "f"}}, "cannot use newfile"),
     ],
 )
 def test_spec_rejects(patch, msg):
@@ -270,8 +278,7 @@ def test_file_contents_identify_the_file(tmp_path):
         files: dict[tuple[int, int], tuple[list[str], bytes]] = {}
         for r in scan(sb):
             if r.kind == "file":
-                base = sb.root if r.tree == "root" else sb.path
-                names, _ = files.setdefault(r.ino, ([], read_unlocked(base, r.path)))
+                names, _ = files.setdefault(r.ino, ([], read_unlocked(sb.base(r.tree), r.path)))
                 names.append(f"{r.tree}:{r.path}")
         return list(files.values())
 

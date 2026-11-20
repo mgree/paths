@@ -25,6 +25,7 @@ import functools
 import hashlib
 import itertools
 import json
+import math
 import multiprocessing
 import os
 import platform
@@ -33,6 +34,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -50,12 +52,14 @@ from treegen.build import (
     scan,
     snapshot_outside,
 )
-from treegen.spec import Expect, Fixture, Op, Semantics, all_fixtures
+from treegen.spec import Expect, Fixture, Op, Semantics, TreeName, all_fixtures
 
 Verdict = Literal["pass", "fail", "skip"]
 
 RESULTS = client.REPO / "results" / "raw"
 DEFAULT_BASE = Path("/dev/shm")
+RACER_DIR = client.REPO / "runner" / "racer"
+RACER = RACER_DIR / "build" / "racer"
 
 # Run memcheck with descriptor tracking. A leaked descriptor, a memory error or
 # a memory leak makes valgrind exit with VALGRIND_ERROR_EXITCODE, which the
@@ -80,21 +84,33 @@ class Task:
     semantics: Semantics
     root_shape: RootShape
     base: str
-    timeout: float
+    timeout: float  # beyond the race, for a race fixture
+    race_seconds: float  # how long a race fixture's driver races
+
+
+@dataclass
+class Seen:
+    """One distinct outcome of the driver's calls, and how many calls had it."""
+
+    count: int
+    ok: bool
+    label: str | None  # error label, normalized
+    identity: list[int] | None  # (dev, ino) the driver reported
+    reached: str | None  # what an ok outcome opened, as tree:path, if declared
 
 
 @dataclass
 class Attempt:
     """What happened in one attempt, before it is judged. A strategy's
-    fingerprint is made of these."""
+    fingerprint is made of these. Without a race the driver makes one call, so
+    there is one outcome; with one, there is an outcome for each different
+    thing its calls did."""
 
-    failure: str | None  # the driver failed (crash, timeout, bad output)
-    ok: bool
-    label: str | None  # error label, normalized
-    reached: str | None  # what an ok outcome opened, as tree:path, if declared
+    failure: str | None  # the driver or the racer failed (crash, timeout, bad output)
+    outcomes: list[Seen]
     expected_ids: dict[str, list[int] | None]  # identity of each expected file
-    identity: list[int] | None  # (dev, ino) the driver reported
     outside_changed: list[str]
+    swaps: int | None  # how often the racer swapped its names; None without a race
     stderr: str
 
 
@@ -115,13 +131,12 @@ class Result:
 # --- one attempt ---------------------------------------------------------------
 
 
-def _identity(sb: Sandbox, tree: str, rel: str) -> list[int] | None:
+def _identity(sb: Sandbox, tree: TreeName, rel: str) -> list[int] | None:
     """Return the (dev, ino) of a regular file, or None. It is looked up one
     directory at a time, without following symlinks. Mount points are crossed
     like any other directory."""
-    base = sb.root if tree == "root" else sb.path
     head, _, name = rel.rpartition("/")
-    with opened(base, DIR_FLAGS) as fd:
+    with opened(sb.base(tree), DIR_FLAGS) as fd:
         try:
             with open_dir(fd, head) as d:
                 st = os.stat(name, dir_fd=d, follow_symlinks=False)
@@ -176,41 +191,94 @@ def _changed(before: dict, after: dict) -> list[str]:
     return sorted(p for p in before.keys() | after.keys() if before.get(p) != after.get(p))
 
 
+def _expected_ids(fx: Fixture, sb: Sandbox) -> dict[str, list[int] | None]:
+    expected = {e.file for e in fx.expect + fx.expect_in_root if e.file is not None}
+    return {f: _identity(sb, "root", f) for f in sorted(expected)}
+
+
+def _names(sb: Sandbox) -> dict[tuple[int, int], str]:
+    """The tree:path of each regular file in the sandbox, by (dev, ino)."""
+    names: dict[tuple[int, int], str] = {}
+    for r in scan(sb):
+        if r.kind == "file":
+            names.setdefault(r.ino, f"{r.tree}:{r.path}")
+    return names
+
+
 def _attempt_in_sandbox(task: Task) -> Attempt:
     fx = task.fixture
     with build_fixture(fx, task.base) as sb:
         cwd = _working_dir(fx, sb)
         root = task.root_shape.path(sb, sb.path / _free_name(fx, "via"))
+        # The racer moves names around, so a race fixture's files are looked
+        # up before it starts. Without a race they are looked up afterwards, to
+        # find a file the call created.
+        expected_ids, names = (_expected_ids(fx, sb), _names(sb)) if fx.race else ({}, {})
         before = snapshot_outside(sb)
-        run = client.once(
-            task.command,
-            task.strategy,
-            fx.request.op,
-            root,
-            fx.request.path,
-            cwd=cwd,
-            timeout=task.timeout,
-        )
+        args = (task.strategy, fx.request.op, root, fx.request.path)
+        swaps, racer_failure, racer_err = None, None, ""
+        if fx.race:
+            driver_limit = task.race_seconds + task.timeout
+            # The runner stops the racer once the driver is done. The limit only
+            # matters if the runner dies first, so it is well past the driver's.
+            limit = math.ceil(driver_limit + task.timeout)
+            with ExitStack() as stack:
+                racer_args, fds = [], []
+                for tree, path in fx.race.exchange:
+                    # Hand the racer each entry's parent as a descriptor, so the
+                    # entries can sit deeper than PATH_MAX.
+                    parent, _, name = path.rpartition("/")
+                    top = stack.enter_context(opened(sb.base(tree), DIR_FLAGS))
+                    fd = stack.enter_context(open_dir(top, parent))
+                    racer_args += [str(fd), name]
+                    fds.append(fd)
+                racer = subprocess.Popen(
+                    [str(RACER), str(limit), *racer_args],
+                    pass_fds=fds,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            try:
+                run = client.race(
+                    task.command, task.race_seconds, *args, cwd=cwd, timeout=driver_limit
+                )
+            finally:
+                racer.terminate()
+                try:
+                    out, racer_err = racer.communicate(timeout=task.timeout)
+                except subprocess.TimeoutExpired:
+                    racer.kill()
+                    out, racer_err = racer.communicate()
+                    racer_err += "racer: did not stop on SIGTERM\n"
+            if racer.returncode == 0:
+                swaps = int(out)
+            elif racer.returncode < 0:
+                racer_failure = f"racer signal {-racer.returncode}"
+            else:
+                racer_failure = f"racer exit status {racer.returncode}"
+        else:
+            run = client.once(task.command, *args, cwd=cwd, timeout=task.timeout)
         after = snapshot_outside(sb)
-        expected = {e.file for e in fx.expect + fx.expect_in_root if e.file is not None}
-        expected_ids = {f: _identity(sb, "root", f) for f in sorted(expected)}
-        outcome = run.outcomes[0] if run.outcomes else None
-        identity = list(outcome.identity) if outcome and outcome.identity else None
-        reached = None
-        if identity is not None:
-            for r in scan(sb):
-                if r.kind == "file" and list(r.ino) == identity:
-                    reached = f"{r.tree}:{r.path}"
-                    break
+        if not fx.race:
+            expected_ids, names = _expected_ids(fx, sb), _names(sb)
+        outcomes = [
+            Seen(
+                count=o.count,
+                ok=o.ok,
+                label=o.label,
+                identity=list(o.identity) if o.identity else None,
+                reached=names.get(o.identity) if o.identity else None,
+            )
+            for o in run.outcomes
+        ]
         return Attempt(
-            failure=run.failure,
-            ok=bool(outcome and outcome.ok),
-            label=outcome.label if outcome else None,
-            reached=reached,
+            failure=run.failure or racer_failure,
+            outcomes=outcomes,
             expected_ids=expected_ids,
-            identity=identity,
             outside_changed=_changed(before, after),
-            stderr=run.stderr,
+            swaps=swaps,
+            stderr=run.stderr + racer_err,
         )
 
 
@@ -227,38 +295,44 @@ def _wanted(e: Expect) -> str:
     return e.result if e.result in ("ok", "refused") else f"error {e.errno}"
 
 
-def _got(a: Attempt) -> str:
-    """What the attempt did, in a few words. The attempt itself keeps the
+def _got(o: Seen) -> str:
+    """What an outcome was, in a few words. The attempt itself keeps the
     details: the path reached, the full failure, the files changed."""
-    if a.failure:
-        return a.failure.partition(":")[0]
-    if not a.ok:
-        return f"error {a.label}"
-    if a.reached is None:
+    if not o.ok:
+        return f"error {o.label}"
+    if o.reached is None:
         return "ok elsewhere"
-    return "ok outside" if a.reached.startswith("outside:") else "ok in root"
+    return "ok outside" if o.reached.startswith("outside:") else "ok in root"
 
 
-def _matches(e: Expect, a: Attempt) -> bool:
+def _matches(e: Expect, a: Attempt, o: Seen) -> bool:
     if e.result == "ok":
-        return a.ok and a.identity is not None and a.identity == a.expected_ids.get(e.file or "")
+        return o.ok and o.identity is not None and o.identity == a.expected_ids.get(e.file or "")
     if e.result == "refused":
-        return not a.ok
-    return not a.ok and a.label is not None and client.same_error(a.label, e.errno or "")
+        return not o.ok
+    return not o.ok and o.label is not None and client.same_error(o.label, e.errno or "")
 
 
 def judge(fx: Fixture, semantics: Semantics, a: Attempt) -> tuple[Verdict, str]:
-    """The verdict, and a short reason such as "wanted refused, got ok outside"."""
+    """The verdict, and a short reason such as "wanted refused, got ok outside".
+    Every one of the driver's calls must have an accepted outcome, and nothing
+    outside may change."""
     expects = fx.expect if semantics == "beneath" else fx.expect_in_root
-    got = f"got {_got(a)}"
     wanted = f"wanted {' or '.join(_wanted(e) for e in expects)}"
     if a.failure:
-        return "fail", f"{wanted}, {got}"
+        return "fail", f"{wanted}, got {a.failure.partition(':')[0]}"
+    calls = sum(o.count for o in a.outcomes)
+
+    def got(o: Seen) -> str:
+        return _got(o) if calls == 1 else f"{_got(o)} ({o.count} of {calls} calls)"
+
+    bad = [o for o in a.outcomes if not any(_matches(e, a, o) for e in expects)]
+    shown = bad[0] if bad else a.outcomes[0]
     if any(p not in fx.outside_changes for p in a.outside_changed):
-        return "fail", f"{wanted}, {got}, wrote outside"
-    if any(_matches(e, a) for e in expects):
-        return "pass", got
-    return "fail", f"{wanted}, {got}"
+        return "fail", f"{wanted}, got {got(shown)}, wrote outside"
+    if bad:
+        return "fail", f"{wanted}, got {got(shown)}"
+    return "pass", "got " + ", ".join(got(o) for o in a.outcomes)
 
 
 def skip_reason(fx: Fixture) -> str | None:
@@ -294,6 +368,10 @@ def run_task(task: Task) -> Result:
 # --- the suite -----------------------------------------------------------------
 
 
+def build_racer() -> None:
+    subprocess.run(["make", "-s", "-C", str(RACER_DIR)], check=True, capture_output=True)
+
+
 def plan(
     drivers: list[client.Driver],
     fixtures: list[Fixture],
@@ -303,6 +381,7 @@ def plan(
     *,
     valgrind: bool,
     root_shapes: tuple[RootShape, ...],
+    race_seconds: float,
 ) -> tuple[list[Task], list[Result]]:
     """Return the attempts to make, and a result for each strategy this host
     can't run."""
@@ -326,19 +405,36 @@ def plan(
                         )  # fmt: skip
                         continue
                     tasks.append(
-                        Task(fx, d.name, command, s.name, s.semantics, shape, base, timeout)
+                        Task(
+                            fx,
+                            d.name,
+                            command,
+                            s.name,
+                            s.semantics,
+                            shape,
+                            base,
+                            timeout,
+                            race_seconds,
+                        )
                     )
     return tasks, unavailable
 
 
 def run_all(tasks: list[Task], jobs: int) -> Iterator[Result]:
-    """Run the tasks in parallel. Results come back in task order, each as soon
-    as it and every task before it have finished."""
+    """Run the tasks in parallel, the race fixtures' tasks last. Results come
+    back in that order, each as soon as it and every task before it have
+    finished.
+
+    A racer's renames make the kernel fail scoped `..` steps with EAGAIN
+    anywhere on the system, so a race running beside another fixture can change
+    that fixture's result. Races may run beside each other: every race fixture
+    accepts EAGAIN."""
     # forkserver: workers start single-threaded, so the namespace helper may
     # fork and unshare inside them.
     ctx = multiprocessing.get_context("forkserver")
     with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
-        yield from pool.map(run_task, tasks, chunksize=1)
+        yield from pool.map(run_task, [t for t in tasks if not t.fixture.race], chunksize=1)
+        yield from pool.map(run_task, [t for t in tasks if t.fixture.race], chunksize=1)
 
 
 def header(started: datetime, tasks: list[Task], options: dict) -> dict:
@@ -413,6 +509,9 @@ def main(argv: list[str] | None = None) -> int:
         help="how to spell the path to the root (default: plain)",
     )
     p.add_argument("--timeout", type=float, default=5.0, help="seconds per attempt (default 5)")
+    p.add_argument(
+        "--race-seconds", type=float, default=1.0, help="how long each race lasts (default 1)"
+    )
     p.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
     p.add_argument("--base", default=str(DEFAULT_BASE), help="where sandboxes go")
     p.add_argument("--no-build", action="store_true", help="do not build the drivers first")
@@ -445,6 +544,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_build:
         for d in drivers:
             client.build(d)
+        build_racer()
     offered = [s.name for d in drivers for s in client.list_strategies(d.check_command)]
     check_names("strategy", args.strategy, offered)
     strategies = set(args.strategy) if args.strategy else None
@@ -461,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
         args.timeout,
         valgrind=args.valgrind,
         root_shapes=root_shapes,
+        race_seconds=args.race_seconds,
     )
     out = args.out or RESULTS / f"check-{started:%Y%m%dT%H%M%SZ}.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)

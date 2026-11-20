@@ -16,7 +16,10 @@ DIR_MODE = 0o755
 FILE_MODE = 0o644
 
 KINDS = ("dir", "file", "fifo", "symlink", "hardlink")
-TREES = ("root", "outside")
+# The two trees a fixture declares: the root the strategy is scoped to, and
+# the outside around it.
+TreeName = Literal["root", "outside"]
+TREES: tuple[TreeName, ...] = get_args(TreeName)
 REQUIRES = ("nonroot", "userns", "linux")
 # read: O_RDONLY, the file must exist. newfile: O_WRONLY|O_CREAT|O_EXCL, the
 # name must not exist. write: O_WRONLY|O_CREAT|O_TRUNC, as creat(2) and the
@@ -35,6 +38,8 @@ MOUNT_TYPES = ("bind", "proc", "casefold")
 # The requirements [[mounts]] implies: an unprivileged process can mount only
 # inside a Linux user namespace.
 MOUNT_REQUIRES = ("userns", "linux")
+# What [race] implies: the racer swaps names with renameat2's RENAME_EXCHANGE.
+RACE_REQUIRES = ("linux",)
 
 
 class SpecError(ValueError):
@@ -117,7 +122,7 @@ class Expect:
 class Mount:
     at: str  # a declared [root] directory
     type: str  # one of MOUNT_TYPES
-    source: tuple[str, str] | None = None  # bind only: (tree, path) of a declared directory
+    source: tuple[TreeName, str] | None = None  # bind only: (tree, path) of a declared directory
 
 
 @dataclass
@@ -134,6 +139,15 @@ class Fixture:
     expect_in_root: tuple[Expect, ...]  # accepted outcomes, RESOLVE_IN_ROOT-style
     outside_changes: tuple[str, ...] = ()  # [outside] files allowed to change; default none
     mounts: tuple[Mount, ...] = ()  # in declaration order
+    race: Race | None = None
+
+
+@dataclass(frozen=True)
+class Race:
+    """Two declared entries that trade places, over and over, while the
+    strategy runs. Each is (tree, path)."""
+
+    exchange: tuple[tuple[TreeName, str], tuple[TreeName, str]]
 
 
 def check_entry_path(path: str) -> None:
@@ -146,7 +160,7 @@ def check_entry_path(path: str) -> None:
             raise SpecError(f"NUL in entry path {path!r}")
 
 
-def split_ref(text: str) -> tuple[str, str]:
+def split_ref(text: str) -> tuple[TreeName, str]:
     """Parse a file reference of the form <tree>:<path>, where tree is root or
     outside."""
     tree, sep, path = text.partition(":")
@@ -239,8 +253,8 @@ def _check_hardlinks(root: Tree, outside: Tree, source: str) -> None:
     are one file with one mode, so a fixture may give the mode on any of its
     names. The mode is copied to all of them, and two different modes for one
     file are an error."""
-    trees = {"root": root, "outside": outside}
-    names: dict[tuple[str, str], list[tuple[str, str]]] = {}  # source -> its names
+    trees: dict[TreeName, Tree] = {"root": root, "outside": outside}
+    names: dict[tuple[TreeName, str], list[tuple[TreeName, str]]] = {}  # source -> its names
     for label, tree in trees.items():
         for e in tree.entries.values():
             if e.kind == "hardlink":
@@ -264,7 +278,7 @@ def parse_mounts(items, root: Tree, outside: Tree, source: str) -> tuple[Mount, 
     """The [[mounts]] list, checked against the trees it mounts on and from."""
     if not isinstance(items, list) or not all(isinstance(m, dict) for m in items):
         raise SpecError(f"{source}: mounts must be a list of tables ([[mounts]])")
-    trees = {"root": root, "outside": outside}
+    trees: dict[TreeName, Tree] = {"root": root, "outside": outside}
     out: list[Mount] = []
     for i, m in enumerate(items):
         where = f"{source}: mounts[{i}]"
@@ -308,18 +322,37 @@ def _check_links_stay_on_one_filesystem(
     """A casefold mount is its own filesystem, and a hard link cannot cross one."""
     casefold = [m.at for m in mounts if m.type == "casefold"]
 
-    def fs(tree: str, path: str) -> str | None:
+    def fs(tree: TreeName, path: str) -> str | None:
         if tree != "root":
             return None
         return next((at for at in casefold if path == at or path.startswith(at + "/")), None)
 
-    for label, tree in (("root", root), ("outside", outside)):
+    trees: dict[TreeName, Tree] = {"root": root, "outside": outside}
+    for label, tree in trees.items():
         for e in tree.entries.values():
             if e.kind == "hardlink" and fs(label, e.path) != fs(*split_ref(e.link)):
                 raise SpecError(
                     f"{source}: hard link {label}:{e.path} and its source {e.link!r} are on "
                     "different filesystems (a casefold mount lies between them)"
                 )
+
+
+def parse_race(table: object, root: Tree, outside: Tree, source: str) -> Race:
+    """The [race] table, checked against the trees it names entries in."""
+    if not isinstance(table, dict):
+        raise SpecError(f"{source}: [race] must be a table")
+    _keys(table, {"exchange"}, "race")
+    names = table.get("exchange")
+    if not isinstance(names, list) or len(names) != 2 or not all(isinstance(n, str) for n in names):
+        raise SpecError(f"{source}: race.exchange must be two entries, as <tree>:<path>")
+    trees: dict[TreeName, Tree] = {"root": root, "outside": outside}
+    a, b = (split_ref(n) for n in names)
+    for tree, path in (a, b):
+        if path not in trees[tree].entries:
+            raise SpecError(f"{source}: race.exchange names {tree}:{path}, which is not declared")
+    if a == b:
+        raise SpecError(f"{source}: race.exchange names {names[0]} twice")
+    return Race((a, b))
 
 
 def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
@@ -336,6 +369,7 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
             "request",
             "expect",
             "mounts",
+            "race",
         },
         source,
     )
@@ -358,6 +392,11 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
     mounts = parse_mounts(data.get("mounts", []), root, outside, source)
     if mounts:
         requires += tuple(r for r in MOUNT_REQUIRES if r not in requires)
+    race = parse_race(data["race"], root, outside, source) if "race" in data else None
+    if race:
+        requires += tuple(r for r in RACE_REQUIRES if r not in requires)
+        if isinstance(data.get("request"), dict) and data["request"].get("op") == "newfile":
+            raise SpecError(f"{source}: a race cannot use newfile, whose second call fails")
     req = data.get("request")
     if not isinstance(req, dict):
         raise SpecError(f"{source}: [request] is required")
@@ -392,6 +431,7 @@ def parse_fixture(data: dict, name: str, source: str = "<fixture>") -> Fixture:
         expect_in_root=in_root,
         outside_changes=changes,
         mounts=mounts,
+        race=race,
     )
 
 

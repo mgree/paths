@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import ns
-from .spec import Entry, Fixture, Tree, split_ref
+from .spec import Entry, Fixture, Tree, TreeName, split_ref
 
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 NEW_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -42,6 +42,14 @@ class Sandbox:
         self.mounts: dict[str, str] = {}  # root-relative mount point -> type, in mount order
         os.mkdir(self.root, 0o755)
         os.chmod(self.root, 0o755)
+
+    def base(self, tree: TreeName) -> Path:
+        """The directory a tree's entry paths are relative to."""
+        match tree:
+            case "root":
+                return self.root
+            case "outside":
+                return self.path
 
     def remove(self) -> None:
         # Unmount first, so that removing the sandbox never deletes through a
@@ -115,22 +123,22 @@ def _split(path: str) -> tuple[str, str]:
     return head, name
 
 
-def _file_contents(fixture: str, tree: str, path: str) -> bytes:
+def _file_contents(fixture: str, tree: TreeName, path: str) -> bytes:
     """The contents of each regular file: one line, '<fixture> <tree>:<path>',
     which is unique across the suite."""
     return f"{fixture} {tree}:{path}\n".encode()
 
 
-def _build_trees(fds: dict[str, int], fx: Fixture, sb: Sandbox) -> None:
+def _build_trees(fds: dict[TreeName, int], fx: Fixture, sb: Sandbox) -> None:
     """Create both trees in phases, one kind of entry at a time across both:
     every directory and file exists before any hard link names it as a source,
     whichever tree it is in. A casefold mount goes on its directory as soon as
     the directory exists, so everything under it is built inside the mount.
     fds maps "root" and "outside" to their bases."""
     casefold = {m.at for m in fx.mounts if m.type == "casefold"}
-    trees = (("outside", fx.outside), ("root", fx.root))
+    trees: dict[TreeName, Tree] = {"outside": fx.outside, "root": fx.root}
     for kind in ("dir", "file", "fifo", "hardlink", "symlink"):
-        for label, tree in trees:
+        for label, tree in trees.items():
             for e in tree.sorted():  # parents sort before children
                 if e.kind == kind:
                     _create(fds, label, e, fx.name, sb)
@@ -138,7 +146,7 @@ def _build_trees(fds: dict[str, int], fx: Fixture, sb: Sandbox) -> None:
                         _mount_casefold(fds["root"], e.path, sb)
 
 
-def _create(fds: dict[str, int], label: str, e: Entry, fixture: str, sb: Sandbox) -> None:
+def _create(fds: dict[TreeName, int], label: TreeName, e: Entry, fixture: str, sb: Sandbox) -> None:
     head, name = _split(e.path)
     with open_dir(fds[label], head) as fd:
         if e.kind == "dir":
@@ -173,7 +181,7 @@ def _mount_late(fx: Fixture, sb: Sandbox) -> None:
         if m.type == "bind":
             assert m.source is not None
             tree, path = m.source
-            ns.mount((sb.root if tree == "root" else sb.path) / path, target, None, ns.MS_BIND)
+            ns.mount(sb.base(tree) / path, target, None, ns.MS_BIND)
         elif m.type == "proc":
             ns.mount("proc", target, "proc")
         if m.type != "casefold":  # casefold mounts were already made during the build
@@ -214,7 +222,7 @@ def build_fixture(fx: Fixture, base: str | Path | None = None) -> Sandbox:
 class Record:
     """One entry as found on disk."""
 
-    tree: str  # "outside" or "root"
+    tree: TreeName
     path: str
     kind: str  # dir, file, fifo, symlink, or bind / proc (a mount point, not descended into)
     mode: int | None  # None for symlinks

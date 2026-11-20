@@ -55,8 +55,10 @@ jobs:
       - name: Type checking
         run: .venv/bin/pyright
 
-      - name: Build the C driver
-        run: make -C strategies/c
+      - name: Build the C driver and the racer
+        run: |
+          make -C strategies/c
+          make -C runner/racer
 
       - name: Static analysis of the C driver
         run: make -C strategies/c analyze

@@ -1,0 +1,31 @@
+hazard = "Symlink race"
+about = """A directory and a symlink to a directory outside trade places, over and over, \
+while the strategy reads d/../x. If d is the symlink when the lookup reaches it, `..` \
+climbs from outside, and x there is a different file. A strategy must never read it. \
+EAGAIN, giving up under the race, is accepted: it costs availability, not safety."""
+
+[root]
+dirs = ["d"]
+files = ["x"]
+symlinks = { "d-link" = "../outside-dir" }
+
+[outside]
+dirs = ["outside-dir"]
+files = ["x"]
+
+[race]
+exchange = ["root:d", "root:d-link"]
+
+[request]
+op = "read"
+path = "d/../x"
+
+[expect]
+accept = [{ result = "ok", file = "x" }, { result = "refused" }]
+
+[expect.in_root]
+accept = [
+  { result = "ok", file = "x" },
+  { result = "error", errno = "ENOENT" },
+  { result = "error", errno = "EAGAIN" },
+]

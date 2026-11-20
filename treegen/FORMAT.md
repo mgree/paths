@@ -42,6 +42,9 @@ at   = "m"                           # a declared [root] directory
 type = "bind"                        # bind | proc | casefold
 from = "outside:d"                   # bind only: a declared directory, as <tree>:<path>
 
+[race]                               # optional: two entries trade places while
+exchange = ["root:real/f", "root:a/link"]  # the strategy runs, as <tree>:<path>
+
 [request]
 op   = "read"                        # read | newfile | write (see below)
 path = "a/link"                      # raw string; anything goes
@@ -71,6 +74,7 @@ Fixture metadata:
   + `linux`: depends on Linux-only behavior.
   + `[[mounts]]` implies `userns` and `linux`, so a fixture with mounts need
     not list them.
+  + `[race]` implies `linux`.
 
 The trees, `[root]` and `[outside]`, take the same keys. `[root]` paths are
 relative to the root, `[outside]` paths to the sandbox. All keys are optional.
@@ -118,6 +122,22 @@ still apply).
     filesystem, so no hard link may join a file inside it to one outside.
 - Bind and proc mounts go on after modes are set, so a mode never reaches
   through one to its source.
+
+`[race]` (optional) makes the fixture a race. While the driver repeats the
+request for a while (its `race` mode), the runner's racer swaps two entries
+with `renameat2`'s `RENAME_EXCHANGE`, over and over. The swap is atomic, so
+both names always exist.
+
+- `exchange` names the two entries, each a declared entry in either tree,
+  written `<tree>:<path>`. They may be of any kind, such as a file and a
+  symlink, or a directory and a symlink.
+- Every call must have an accepted outcome, and one call outside `[expect]`
+  fails the strategy. So `[expect]` usually lists one outcome per position of
+  the swap, with `accept`.
+- `request.op` cannot be `newfile`, whose second call would fail with
+  `EEXIST`.
+- The files `[expect]` names are identified before the race starts, since the
+  racer moves names around.
 
 The `[request]` is what the strategy is asked to do; both keys are required.
 

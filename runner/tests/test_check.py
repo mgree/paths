@@ -18,6 +18,7 @@ FIXTURES = all_fixtures()
 def shape_results() -> list[check.Result]:
     """One run of the suite under every root shape, shared by the tests."""
     client.build(C)
+    check.build_racer()
     tasks, unavailable = check.plan(
         [C],
         FIXTURES,
@@ -26,6 +27,9 @@ def shape_results() -> list[check.Result]:
         timeout=2,
         valgrind=False,
         root_shapes=tuple(check.RootShape),
+        # Long enough to catch every weak strategy many times over: the
+        # weakest, realpath, escapes about a thousand times a second.
+        race_seconds=0.2,
     )
     return [*check.run_all(tasks, jobs=16), *unavailable]
 
@@ -61,7 +65,7 @@ def test_correct_strategies_pass_everything(strategy):
 def test_pure_openat2_fails_only_past_path_max(strategy):
     failed = {f: r for f, r in verdicts(strategy).items() if r.verdict == "fail"}
     assert set(failed) == {"over-long-path", "over-long-path-dotdot"}
-    assert all(r.attempt and r.attempt.label == "ENAMETOOLONG" for r in failed.values())
+    assert all(r.reason == "wanted ok, got error ENAMETOOLONG" for r in failed.values())
 
 
 def test_string_concat_fails_every_refusal_fixture():
@@ -97,19 +101,22 @@ def test_runner_rejects_unknown_names(args, capsys):
 
 def outcome(r: check.Result):
     a = r.attempt
-    return (r.verdict, a and (a.failure, a.ok, a.label, a.reached, a.outside_changed))
+    kinds = a and sorted((o.ok, o.label or "", o.reached or "") for o in a.outcomes)
+    return (r.verdict, a and (a.failure, kinds, a.outside_changed))
 
 
 def test_root_shape_changes_only_the_symlink_budget():
     """The path to the root changes no outcome, with one exception. The kernel
     counts the symlinks on the way to the root toward its limit of 40, so the
     strategies that hand it root and request together have one hop fewer, and
-    the 40-link chain fails for them with ELOOP."""
+    the 40-link chain fails for them with ELOOP. Race fixtures are left out:
+    which outcomes a race produces varies from run to run."""
+    racing = {fx.name for fx in FIXTURES if fx.race}
     plain = {(r.strategy, r.fixture): r for r in results()}
     changed = {
         (r.root_shape, r.strategy, r.fixture): r.reason
         for r in shape_results()
-        if outcome(r) != outcome(plain[r.strategy, r.fixture])
+        if r.fixture not in racing and outcome(r) != outcome(plain[r.strategy, r.fixture])
     }
     assert changed == {
         (shape, strategy, "symlink-chain-40"): "wanted ok, got error ELOOP"
@@ -136,18 +143,18 @@ REFUSE = parse_fixture(
 )
 
 
-def attempt(**kw):
-    base = dict(
-        failure=None,
-        ok=False,
-        label="EXDEV",
-        reached=None,
-        expected_ids={},
-        identity=None,
-        outside_changed=[],
-        stderr="",
-    )
-    return check.Attempt(**{**base, **kw})
+def attempt(
+    failure: str | None = None,
+    ok: bool = False,
+    label: str | None = "EXDEV",
+    identity: list[int] | None = None,
+    reached: str | None = None,
+    **kw,
+):
+    """An attempt whose driver made one call with the given outcome."""
+    one = check.Seen(count=1, ok=ok, label=label, identity=identity, reached=reached)
+    base = dict(expected_ids={}, outside_changed=[], swaps=None, stderr="")
+    return check.Attempt(failure=failure, outcomes=[] if failure else [one], **{**base, **kw})
 
 
 @pytest.mark.parametrize("failure", ["timeout", "signal 11", "exit status 1", "bad output: x"])
@@ -159,6 +166,19 @@ def test_a_driver_failure_is_never_a_refusal(failure):
 def test_any_change_outside_fails_even_a_matching_outcome():
     verdict, reason = check.judge(REFUSE, "beneath", attempt(outside_changed=["secret"]))
     assert verdict == "fail" and "wrote outside" in reason
+
+
+def test_one_bad_call_fails_a_race():
+    """Under a race, every call must have an accepted outcome: one call that
+    reached outside fails the strategy, however many others refused."""
+    calls = [
+        check.Seen(count=999, ok=False, label="ELOOP", identity=None, reached=None),
+        check.Seen(count=1, ok=True, label=None, identity=[1, 9], reached="outside:secret"),
+    ]
+    a = attempt()
+    a.outcomes = calls
+    verdict, reason = check.judge(REFUSE, "beneath", a)
+    assert verdict == "fail" and reason == "wanted refused, got ok outside (1 of 1000 calls)"
 
 
 def test_ok_must_reach_the_expected_file():

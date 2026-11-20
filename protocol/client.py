@@ -265,6 +265,21 @@ def once(
     return invoke(command, "once", [strategy, op, root, path], cwd=cwd, timeout=timeout)
 
 
+def race(
+    command: tuple[str, ...],
+    seconds: float,
+    strategy: str,
+    op: Op,
+    root: str,  # passed as spelled, as for once
+    path: str,
+    *,
+    cwd: Path,
+    timeout: float,
+) -> Run:
+    args = [f"{seconds:g}", strategy, op, root, path]
+    return invoke(command, "race", args, cwd=cwd, timeout=timeout)
+
+
 def _text(b: bytes | str | None) -> str:
     if b is None:
         return ""

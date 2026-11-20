@@ -33,6 +33,11 @@
 
 #include "strategy.h"
 
+// How often to look up the last component again when it changes between two
+// lookups (a symlink when opened, gone when read), before giving up with
+// EAGAIN. The same limit as openat2.c's.
+#define MAX_RETRIES 128
+
 static void *prepare(const char *path, enum semantics semantics) {
     struct root *root = malloc(sizeof *root);
     if (root == NULL) {
@@ -157,7 +162,7 @@ int walk_open(void *state, const char *path, int flags, const char **label) {
             continue;
         }
 
-        int linkfd = -1;
+        int linkfd = -1; // a middle component that is a symlink
         if (!last) {
             int dfd = openat(top(&s), name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
             if (dfd < 0) {
@@ -184,38 +189,49 @@ int walk_open(void *state, const char *path, int flags, const char **label) {
                 goto out;
             }
             linkfd = dfd;
-        } else {
-            fd = openat(top(&s), name, flags | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY, OPEN_MODE);
-            if (fd >= 0) {
-                fd = keep_regular(fd, label);
-                e = errno;
-                goto out;
-            }
-            e = errno;
-            if (e != ELOOP || strcmp(name, ".") == 0) {
-                goto out;
-            }
-            // ELOOP: the last component may be a symlink; read and follow it.
-            linkfd = openat(top(&s), name, O_PATH | O_NOFOLLOW | O_CLOEXEC);
-            struct stat sb;
-            if (linkfd < 0 || fstat(linkfd, &sb) < 0 || !S_ISLNK(sb.st_mode)) {
-                if (linkfd >= 0) {
-                    close(linkfd);
-                }
-                errno = e;
-                goto out;
-            }
         }
 
-        // linkfd is a symlink: replace its component with its text.
-        if (++hops > MAX_HOPS) {
+        // A middle component that is a symlink, or the last component (which
+        // may be one). Either way, n becomes the length of the link's text.
+        ssize_t n;
+        if (linkfd >= 0) {
+            if (++hops > MAX_HOPS) {
+                close(linkfd);
+                e = ELOOP;
+                goto out;
+            }
+            n = readlinkat(linkfd, "", link, sizeof link);
+            e = errno;
             close(linkfd);
-            e = ELOOP;
-            goto out;
+        } else {
+            for (int tries = 0;; tries++) {
+                fd = openat(top(&s), name, flags | O_NOFOLLOW | O_NONBLOCK | O_NOCTTY, OPEN_MODE);
+                if (fd >= 0) {
+                    fd = keep_regular(fd, label);
+                    e = errno;
+                    goto out;
+                }
+                e = errno;
+                if (e != ELOOP || strcmp(name, ".") == 0) {
+                    goto out;
+                }
+                // ELOOP: the name is a symlink, so read it. EINVAL means it has
+                // stopped being one since the open: look it up again.
+                n = readlinkat(top(&s), name, link, sizeof link);
+                e = errno;
+                if (n >= 0 || e != EINVAL) {
+                    break;
+                }
+                if (tries == MAX_RETRIES) {
+                    e = EAGAIN;
+                    goto out;
+                }
+            }
+            if (n >= 0 && ++hops > MAX_HOPS) {
+                e = ELOOP;
+                goto out;
+            }
         }
-        ssize_t n = readlinkat(linkfd, "", link, sizeof link);
-        e = errno;
-        close(linkfd);
         if (n < 0) {
             goto out;
         }
