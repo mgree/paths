@@ -1,0 +1,57 @@
+hazard = "Symlink hop limit"
+about = """One link more than Linux follows in one lookup, so the kernel says ELOOP. A userspace \
+walk must stop at the same count, or it disagrees with openat2 at the boundary."""
+
+[root]
+files = ["f"]
+
+[root.symlinks]
+l01 = "l02"
+l02 = "l03"
+l03 = "l04"
+l04 = "l05"
+l05 = "l06"
+l06 = "l07"
+l07 = "l08"
+l08 = "l09"
+l09 = "l10"
+l10 = "l11"
+l11 = "l12"
+l12 = "l13"
+l13 = "l14"
+l14 = "l15"
+l15 = "l16"
+l16 = "l17"
+l17 = "l18"
+l18 = "l19"
+l19 = "l20"
+l20 = "l21"
+l21 = "l22"
+l22 = "l23"
+l23 = "l24"
+l24 = "l25"
+l25 = "l26"
+l26 = "l27"
+l27 = "l28"
+l28 = "l29"
+l29 = "l30"
+l30 = "l31"
+l31 = "l32"
+l32 = "l33"
+l33 = "l34"
+l34 = "l35"
+l35 = "l36"
+l36 = "l37"
+l37 = "l38"
+l38 = "l39"
+l39 = "l40"
+l40 = "l41"
+l41 = "f"
+
+[request]
+op = "read"
+path = "l01"
+
+[expect]
+result = "error"
+errno = "ELOOP"

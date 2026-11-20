@@ -1,0 +1,14 @@
+hazard = "Symlink loops"
+about = """Two links that name each other. Every strategy must stop with ELOOP; one that \
+follows links without counting them never finishes."""
+
+[root]
+symlinks = { "a" = "b", "b" = "a" }
+
+[request]
+op = "read"
+path = "a"
+
+[expect]
+result = "error"
+errno = "ELOOP"

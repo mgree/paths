@@ -1,0 +1,15 @@
+hazard = "Symlink loops"
+about = """The loop from symlink-loop, but in the middle of the path. A strategy that walks \
+the path itself may handle a link in the middle separately from one at the end, and each \
+must count toward the limit."""
+
+[root]
+symlinks = { "a" = "b", "b" = "a" }
+
+[request]
+op = "read"
+path = "a/x"
+
+[expect]
+result = "error"
+errno = "ELOOP"
