@@ -13,6 +13,7 @@ dev = ["pytest==9.2.0", "ruff==0.17.5", "pyright==1.1.414"]  # pinned: formatter
 [tool.pytest.ini_options]
 testpaths = ["treegen/tests", "protocol/tests", "runner/tests"]
 pythonpath = ["."]
+markers = ["slow: takes much longer than the rest on this host"]
 
 [tool.ruff]
 line-length = 100

@@ -205,6 +205,25 @@ def _names(sb: Sandbox) -> dict[tuple[int, int], str]:
     return names
 
 
+# The two CPUs a race worker runs its races on: the driver on the first, the
+# racer on the second. _claim_cpus sets it in each race worker. It is None
+# elsewhere, and when there are too few CPUs to pair.
+_race_cpus: tuple[int, int] | None = None
+
+
+def cpu_pairs() -> list[tuple[int, int]]:
+    """The CPUs this process may run on, in disjoint pairs. With an odd number,
+    the last CPU is left out."""
+    cpus = sorted(os.sched_getaffinity(0))
+    return list(zip(cpus[0::2], cpus[1::2], strict=False))
+
+
+def _claim_cpus(claims) -> None:
+    """Take this worker's pair of CPUs, or None, from the queue."""
+    global _race_cpus
+    _race_cpus = claims.get()
+
+
 def _attempt_in_sandbox(task: Task) -> Attempt:
     fx = task.fixture
     with build_fixture(fx, task.base) as sb:
@@ -232,6 +251,13 @@ def _attempt_in_sandbox(task: Task) -> Attempt:
                     fd = stack.enter_context(open_dir(top, parent))
                     racer_args += [str(fd), name]
                     fds.append(fd)
+                # The kernel's spurious EXDEV needs a swap in the middle of one
+                # lookup, which is rare unless the driver and the racer run at
+                # the same time. So each gets its own CPU, inherited from this
+                # process: the racer is started while this process is on the
+                # racer's CPU, and the driver after it moves to the driver's.
+                if _race_cpus is not None:
+                    os.sched_setaffinity(0, {_race_cpus[1]})
                 racer = subprocess.Popen(
                     [str(RACER), str(limit), *racer_args],
                     pass_fds=fds,
@@ -239,6 +265,8 @@ def _attempt_in_sandbox(task: Task) -> Attempt:
                     stderr=subprocess.PIPE,
                     text=True,
                 )
+                if _race_cpus is not None:
+                    os.sched_setaffinity(0, {_race_cpus[0]})
             try:
                 run = client.race(
                     task.command, task.race_seconds, *args, cwd=cwd, timeout=driver_limit
@@ -429,13 +457,27 @@ def run_all(tasks: list[Task], jobs: int) -> Iterator[Result]:
     A racer's renames make the kernel fail scoped `..` steps with EAGAIN
     anywhere on the system, so a race running beside another fixture can change
     that fixture's result. Races may run beside each other: every race fixture
-    accepts EAGAIN."""
+    accepts EAGAIN. Each race takes two CPUs, one for the driver and one for the
+    racer, so at most one race runs per pair of CPUs."""
     # forkserver: workers start single-threaded, so the namespace helper may
     # fork and unshare inside them.
     ctx = multiprocessing.get_context("forkserver")
     with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
         yield from pool.map(run_task, [t for t in tasks if not t.fixture.race], chunksize=1)
-        yield from pool.map(run_task, [t for t in tasks if t.fixture.race], chunksize=1)
+    races = [t for t in tasks if t.fixture.race]
+    if not races:
+        return
+    pairs = cpu_pairs()[:jobs]
+    claims = ctx.SimpleQueue()
+    for pair in pairs or [None]:
+        claims.put(pair)
+    with ProcessPoolExecutor(
+        max_workers=len(pairs) or 1,
+        mp_context=ctx,
+        initializer=_claim_cpus,
+        initargs=(claims,),
+    ) as pool:
+        yield from pool.map(run_task, races, chunksize=1)
 
 
 def header(started: datetime, tasks: list[Task], options: dict) -> dict:

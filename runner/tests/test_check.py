@@ -3,6 +3,7 @@ our predictions for each strategy, the fixtures' negative control, and the
 judging rules."""
 
 import functools
+import warnings
 
 import pytest
 from protocol import client
@@ -68,18 +69,52 @@ def test_pure_openat2_fails_only_past_path_max(strategy):
     assert all(r.reason == "wanted ok, got error ENAMETOOLONG" for r in failed.values())
 
 
-@pytest.mark.parametrize(
-    "strategy",
-    ["openat2-beneath", "openat2-in-root", "openat2-walk-beneath", "openat2-walk-in-root"],
-)
+OPENAT2 = ["openat2-beneath", "openat2-in-root", "openat2-walk-beneath", "openat2-walk-in-root"]
+
+
+@functools.cache
+def one_cpu_dir_out_of_root() -> dict[str, check.Result]:
+    """swap-race-dir-out-of-root's results for the openat2 strategies, from
+    races long enough for one CPU. There, the driver and the racer take turns,
+    so a swap lands in the middle of a lookup only when the driver is preempted
+    there, about twice a second. A 5-second race should miss about once in
+    20,000 runs."""
+    fx = next(fx for fx in FIXTURES if fx.name == "swap-race-dir-out-of-root")
+    tasks, _ = check.plan(
+        [C],
+        [fx],
+        set(OPENAT2),
+        "/dev/shm",
+        timeout=2,
+        valgrind=False,
+        root_shapes=(check.RootShape.PLAIN,),
+        race_seconds=5,
+    )
+    return {r.strategy: r for r in check.run_all(tasks, jobs=1)}
+
+
+# Slow only on one CPU, where it runs its own 5-second races.
+SLOW_ON_ONE_CPU = [] if check.cpu_pairs() else [pytest.mark.slow]
+
+
+@pytest.mark.parametrize("strategy", [pytest.param(s, marks=SLOW_ON_ONE_CPU) for s in OPENAT2])
 def test_moving_a_directory_out_of_the_root_gives_openat2_exdev(strategy):
     """swap-race-dir-out-of-root exists to count the EXDEVs openat2 gives when
     a directory on the path moves out of the root mid-lookup. Its expectations
     accept EXDEV without requiring it, so this checks that the race really
-    produces some."""
-    attempt = verdicts(strategy)["swap-race-dir-out-of-root"].attempt
+    produces some. With one CPU it needs much longer races, so it runs its own."""
+    if check.cpu_pairs():
+        result = verdicts(strategy)["swap-race-dir-out-of-root"]
+    else:
+        warnings.warn(
+            "only one CPU: this test runs its own 5-second race; skip it with -m 'not slow'",
+            stacklevel=1,
+        )
+        result = one_cpu_dir_out_of_root()[strategy]
+    attempt = result.attempt
     assert attempt is not None
-    assert any(o.label == "EXDEV" for o in attempt.outcomes)
+    tally = {o.label or o.reached: o.count for o in attempt.outcomes}
+    assert "EXDEV" in tally, f"no EXDEV in {tally}, from {attempt.swaps} swaps"
 
 
 def test_string_concat_fails_every_refusal_fixture():
