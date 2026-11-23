@@ -127,9 +127,9 @@ UNAVAILABLE <name> <semantics> <reason>
 
 ## Environment
 
-- Drivers run with an empty working directory in the sandbox, outside the
-  root, so a strategy that ignores `<root>` fails the controls, and anything
-  it creates shows up as a change outside the root.
+- Drivers run with an empty working directory directly inside the sandbox,
+  outside the root, so a strategy that ignores `<root>` fails the controls,
+  and anything it creates shows up as a change outside the root.
 - For fixtures with mounts, the runner starts the driver inside the fixture's
   namespace. Nothing changes for the driver.
 

@@ -118,7 +118,8 @@ def test_expectations_name_real_entries(fx):
 def test_has_outside_or_not_an_escape(fx):
     """A read escape needs an outside file to land on, or the runner cannot tell
     an escape from a miss. (newfile and write escapes create something outside,
-    which the outside snapshot catches even when [outside] is empty.)"""
+    which the outside snapshot catches even when [outside] is empty.) NB that
+    /proc is an escape hatch here."""
     target = fx.root.entries.get(fx.request.path)
     names_own_entry = target is not None and target.kind != "symlink"  # e.g. a FIFO
     escapes = (
@@ -127,7 +128,13 @@ def test_has_outside_or_not_an_escape(fx):
         and not names_own_entry
     )
     links_out = any((e.target or "").startswith("{sandbox}") for e in fx.root.entries.values())
-    targets_outside = bool(fx.outside.entries) or links_out or fx.request.path.startswith("/")
+    # A proc mount's magic links reach the driver's own files, such as its
+    # program (self/exe), so a request through one has something to land on.
+    path = fx.request.path
+    through_proc = any(
+        m.type == "proc" and (path == m.at or path.startswith(m.at + "/")) for m in fx.mounts
+    )
+    targets_outside = bool(fx.outside.entries) or links_out or path.startswith("/") or through_proc
     assert not escapes or targets_outside
 
 

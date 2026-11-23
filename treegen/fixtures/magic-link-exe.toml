@@ -1,0 +1,20 @@
+hazard = "Magic links"
+about = """With /proc mounted inside the root, proc/self/exe is a magic link to the running \
+program, a regular file outside the root. Unlike proc/self/root and proc/self/cwd, it is \
+the last component and names a file, so a strategy that follows it opens that file \
+directly. Correct strategies refuse magic links, or read them as links and re-anchor the \
+absolute text they hold at the root."""
+
+[root]
+dirs = ["proc"]
+
+[[mounts]]
+at = "proc"
+type = "proc"
+
+[request]
+op = "read"
+path = "proc/self/exe"
+
+[expect]
+result = "refused"

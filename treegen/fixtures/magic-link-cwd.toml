@@ -1,0 +1,24 @@
+hazard = "Magic links"
+about = """With /proc mounted inside the root, proc/self/cwd is a magic link to the process's \
+working directory, which for a server is often outside its root. The runner starts the \
+driver in a directory in the sandbox, so a symlink through proc/self/cwd/.. reaches the \
+sandbox and its secret. Correct strategies refuse magic links, or read them as links and \
+re-anchor the absolute text they hold at the root."""
+
+[root]
+dirs = ["proc"]
+symlinks = { "l" = "proc/self/cwd/../secret" }
+
+[outside]
+files = ["secret"]
+
+[[mounts]]
+at = "proc"
+type = "proc"
+
+[request]
+op = "read"
+path = "l"
+
+[expect]
+result = "refused"

@@ -13,10 +13,17 @@ Every fixture is built in a fresh sandbox directory:
 <sandbox>/
   <root_name>/     the root handed to the strategy ([root] entries)
   ...              everything else ([outside] entries), siblings of the root
+  <cwd>/           the driver's working directory, empty, made by the runner
 ```
 
 Escapes are aimed at `[outside]` entries, so the runner can check that
 nothing outside the root was opened, created or changed.
+
+The runner names the working directory so that it collides with no declared
+entry, and the driver protocol promises that it sits directly inside the
+sandbox. So a path through the driver's working directory and then `..`, such
+as `proc/self/cwd/../secret` under a proc mount, reaches the `[outside]`
+entries.
 
 ## Keys
 
@@ -116,8 +123,8 @@ still apply).
 - `type` is the kind of mount.
   + `bind`: the directory shows another declared directory, named by `from`.
     Nothing may be declared under `at`, since the mount would hide it.
-  + `proc`: a procfs, so `<at>/self/root` and `<at>/self/fd/N` are magic
-    links. Nothing may be declared under `at`.
+  + `proc`: a procfs, so `<at>/self/root`, `<at>/self/cwd`, `<at>/self/exe`
+    and `<at>/self/fd/N` are magic links. Nothing may be declared under `at`.
   + `casefold`: an empty case-insensitive tmpfs (Unicode case folding, which
     also equates NFC and NFD spellings). It goes on as soon as `at` exists, so
     the entries declared under `at` are built inside it. It is a separate
