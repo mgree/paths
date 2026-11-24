@@ -54,6 +54,9 @@ jobs:
       - name: Lint
         run: .venv/bin/ruff check .
 
+      - name: Lint the shell scripts
+        run: shellcheck tools/benchmode
+
       - name: Type checking
         run: .venv/bin/pyright
 

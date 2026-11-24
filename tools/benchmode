@@ -1,0 +1,305 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# benchmode readies this machine for benchmarks, and puts it back afterward.
+#
+#   sudo tools/benchmode on             tune the machine and set CPUs aside
+#   sudo tools/benchmode run -- CMD...  run CMD as you, on the set-aside CPUs
+#   sudo tools/benchmode off            undo everything on did
+#   tools/benchmode --dry-run on|off|run ...
+#                                       check, and print what would be done
+#
+# The CPUs to set aside are the ones the kernel command line names in
+# rcu_nocbs=, so the choice is written down in one place, at boot. on then:
+#   1. runs pyperf's system tune with those CPUs, which sets the performance
+#      governor, turns turbo off and moves interrupts to the other CPUs;
+#   2. makes the cgroup paths-bench an isolated cpuset partition of those
+#      CPUs, so the scheduler puts nothing else on them;
+#   3. confines the RCU callback threads (rcuo*) to the other CPUs.
+#
+# Only processes inside paths-bench can run on its CPUs. run moves itself into
+# the cgroup as root, then becomes the user who ran sudo and runs CMD, so
+# everything CMD starts is inside too, and nothing runs as root. run changes
+# nothing that needs undoing. off kills any process left in the cgroup before
+# it removes it.
+#
+# --dry-run needs no root. It does all the parsing and checking, then prints
+# each command and file write instead of making it. BENCHMODE_CMDLINE and
+# BENCHMODE_SYS name a kernel command line file and a /sys tree to read in
+# place of the real ones, for tests.
+
+set -euo pipefail
+
+NAME=benchmode
+CMDLINE=${BENCHMODE_CMDLINE:-/proc/cmdline}
+SYS=${BENCHMODE_SYS:-/sys}
+CGROUP_ROOT=$SYS/fs/cgroup
+CGROUP=$CGROUP_ROOT/paths-bench
+REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PYTHON=${PYTHON:-$REPO/.venv/bin/python}
+DRY_RUN=0
+
+die() {
+    echo "$NAME: $*" >&2
+    exit 1
+}
+
+warn() {
+    echo "$NAME: warning: $*" >&2
+}
+
+usage() {
+    echo "usage: $NAME [--dry-run] on | off | run -- CMD..." >&2
+    exit 2
+}
+
+# Run a command, or print it under --dry-run. With --quiet first, the
+# command's own output is discarded. With --note TEXT, the dry run prints TEXT
+# as a comment after the command.
+act() {
+    local quiet=0 note=
+    if [[ $1 == --quiet ]]; then
+        quiet=1
+        shift
+    fi
+    if [[ $1 == --note ]]; then
+        note="  # $2"
+        shift 2
+    fi
+    if ((DRY_RUN)); then
+        echo "run: $*$note"
+    elif ((quiet)); then
+        "$@" >/dev/null
+    else
+        "$@"
+    fi
+}
+
+# Write a value to a file, or print the write under --dry-run.
+put() {
+    if ((DRY_RUN)); then
+        echo "write: $1 <- $2"
+    else
+        echo "$2" >"$1"
+    fi
+}
+
+# Append each CPU in a kernel CPU list such as 4-5,10-11 to the array named by
+# the first argument. It fills an array instead of printing, so that a bad list
+# stops the script: die inside $(...) would end only the subshell.
+expand_into() {
+    local -n expand_out=$1
+    local list=$2 part lo hi cpu
+    local -a parts
+    IFS=, read -ra parts <<<"$list"
+    for part in "${parts[@]}"; do
+        if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            lo=${BASH_REMATCH[1]} hi=${BASH_REMATCH[2]}
+        elif [[ $part =~ ^[0-9]+$ ]]; then
+            lo=$part hi=$part
+        else
+            die "cannot read CPU list '$list': '$part' is not a CPU or a range of CPUs"
+        fi
+        ((lo <= hi)) || die "cannot read CPU list '$list': the range '$part' is backwards"
+        for ((cpu = lo; cpu <= hi; cpu++)); do
+            expand_out+=("$cpu")
+        done
+    done
+}
+
+# Sort the CPU numbers in the array named by the argument, dropping repeats.
+sort_cpus() {
+    local -n sort_in=$1
+    mapfile -t sort_in < <(printf '%s\n' "${sort_in[@]}" | sort -n -u)
+}
+
+# Print CPU numbers as a comma-separated list.
+join_cpus() {
+    local IFS=,
+    echo "$*"
+}
+
+# Set SUGGESTED to CPUs worth setting aside: both hyperthreads of the two
+# highest-numbered cores, which leaves the lower ones for everything else.
+suggest() {
+    local -a lists cpus=()
+    local list
+    mapfile -t lists < <(sort -u -t, -k1,1n "$SYS"/devices/system/cpu/cpu[0-9]*/topology/thread_siblings_list | tail -n 2)
+    for list in "${lists[@]}"; do
+        expand_into cpus "$list"
+    done
+    sort_cpus cpus
+    SUGGESTED=$(join_cpus "${cpus[@]}")
+}
+
+# Explain how to set rcu_nocbs=, and stop.
+no_rcu_nocbs() {
+    suggest
+    cat >&2 <<EOF
+$NAME: the kernel command line has no rcu_nocbs=, which names the CPUs to set
+aside for benchmarks. To set it, choose whole cores (both hyperthreads of each)
+and add them at boot. For example, for CPUs $SUGGESTED:
+
+  echo 'GRUB_CMDLINE_LINUX_DEFAULT="\$GRUB_CMDLINE_LINUX_DEFAULT rcu_nocbs=$SUGGESTED"' \\
+    | sudo tee /etc/default/grub.d/rcu-nocbs.cfg
+  sudo update-grub
+  sudo reboot
+
+Or skip benchmark mode, and run the harness with --unpinned. Its results will be
+less precise, and marked as such.
+EOF
+    exit 1
+}
+
+# Append the CPUs named by the last rcu_nocbs= on the kernel command line to
+# the array named by the argument, sorted.
+bench_cpus_into() {
+    local word value=""
+    local found=0
+    for word in $(<"$CMDLINE"); do
+        case $word in
+            rcu_nocbs=*) value=${word#rcu_nocbs=} found=1 ;;
+            rcu_nocbs) value="" found=1 ;;
+        esac
+    done
+    ((found)) || no_rcu_nocbs
+    if [[ -z $value || $value == all ]]; then
+        die "rcu_nocbs names every CPU, so none would be left for everything else; name only the CPUs to set aside"
+    fi
+    expand_into "$1" "$value"
+    sort_cpus "$1"
+}
+
+# Stop unless this is root or a dry run. The message repeats the command line
+# with --dry-run added, quoted so that it can be pasted back into a shell.
+need_root() {
+    if ((!DRY_RUN)) && ((EUID != 0)); then
+        local again
+        printf -v again '%q ' "$0" --dry-run "${ARGS[@]}"
+        die "$1 needs root: run it with sudo, or see what it would do with: ${again% }"
+    fi
+}
+
+# Check the CPUs to set aside, and set BENCH and OTHERS to them and to the
+# rest of the online CPUs, as kernel CPU lists.
+choose_cpus() {
+    local -a bench=() online=() others=() siblings
+    bench_cpus_into bench
+    expand_into online "$(<"$SYS/devices/system/cpu/online")"
+    local cpu sibling
+    for cpu in "${bench[@]}"; do
+        [[ " ${online[*]} " == *" $cpu "* ]] || die "rcu_nocbs names CPU $cpu, which is not online"
+        siblings=()
+        expand_into siblings "$(<"$SYS/devices/system/cpu/cpu$cpu/topology/thread_siblings_list")"
+        for sibling in "${siblings[@]}"; do
+            if [[ " ${bench[*]} " != *" $sibling "* ]]; then
+                warn "CPU $cpu is set aside but its hyperthread sibling, CPU $sibling, is not; work on CPU $sibling will slow benchmarks on CPU $cpu"
+            fi
+        done
+    done
+    for cpu in "${online[@]}"; do
+        [[ " ${bench[*]} " == *" $cpu "* ]] || others+=("$cpu")
+    done
+    ((${#others[@]} > 0)) || die "rcu_nocbs names every online CPU, so none would be left for everything else"
+    BENCH=$(join_cpus "${bench[@]}")
+    OTHERS=$(join_cpus "${others[@]}")
+}
+
+# Print the process ID and name of each RCU callback thread, one per line.
+# The number in a name such as rcuop/4 is the CPU whose callbacks the thread
+# handles, not a CPU it is confined to.
+rcuo_threads() {
+    local comm name
+    for comm in /proc/[0-9]*/comm; do
+        # A process can exit between the listing and the read.
+        read -r name 2>/dev/null <"$comm" || continue
+        if [[ $name == rcuo* ]]; then
+            comm=${comm%/comm}
+            echo "${comm##*/} $name"
+        fi
+    done | sort -n
+}
+
+cmd_on() {
+    need_root on
+    choose_cpus
+    act "$PYTHON" -m pyperf system tune --affinity="$BENCH"
+    if ! grep -qw cpuset "$CGROUP_ROOT/cgroup.subtree_control"; then
+        put "$CGROUP_ROOT/cgroup.subtree_control" +cpuset
+    fi
+    if [[ -d $CGROUP ]] && ((!DRY_RUN)); then
+        die "$CGROUP already exists; run off first"
+    fi
+    act mkdir "$CGROUP"
+    put "$CGROUP/cpuset.cpus" "$BENCH"
+    put "$CGROUP/cpuset.cpus.partition" isolated
+    if ((!DRY_RUN)); then
+        local state
+        state=$(<"$CGROUP/cpuset.cpus.partition")
+        [[ $state == isolated ]] || die "the kernel did not make $CGROUP an isolated partition: $state"
+    fi
+    local pid name
+    while read -r pid name; do
+        act --quiet --note "$name" taskset -pc "$OTHERS" "$pid"
+    done < <(rcuo_threads)
+    echo "$NAME: CPUs $BENCH are set aside; CPUs $OTHERS run everything else"
+}
+
+cmd_off() {
+    need_root off
+    local online
+    online=$(<"$SYS/devices/system/cpu/online")
+    act "$PYTHON" -m pyperf system reset
+    if [[ -d $CGROUP ]] || ((DRY_RUN)); then
+        put "$CGROUP/cgroup.kill" 1
+        if ((!DRY_RUN)); then
+            local tries
+            for ((tries = 0; tries < 50; tries++)); do
+                [[ -s $CGROUP/cgroup.procs ]] || break
+                sleep 0.1
+            done
+        fi
+        act rmdir "$CGROUP"
+    fi
+    local pid name
+    while read -r pid name; do
+        act --quiet --note "$name" taskset -pc "$online" "$pid"
+    done < <(rcuo_threads)
+    echo "$NAME: all CPUs run everything again"
+}
+
+cmd_run() {
+    (($# > 0)) || usage
+    need_root run
+    # CMD runs as the user who ran sudo. A dry run without sudo shows CMD
+    # running as the user who ran benchmode.
+    local uid gid
+    if [[ -n ${SUDO_UID:-} && -n ${SUDO_GID:-} ]]; then
+        uid=$SUDO_UID gid=$SUDO_GID
+    elif ((EUID != 0)); then
+        uid=$(id -u) gid=$(id -g)
+    else
+        die "run is root but was not started by sudo, so it cannot tell which user should run CMD; start it with sudo from your own account"
+    fi
+    if ((!DRY_RUN)); then
+        [[ -d $CGROUP ]] || die "$CGROUP does not exist: run on first"
+    fi
+    put "$CGROUP/cgroup.procs" $$
+    act exec setpriv --reuid="$uid" --regid="$gid" --init-groups -- "$@"
+}
+
+if [[ ${1:-} == --dry-run ]]; then
+    DRY_RUN=1
+    shift
+fi
+ARGS=("$@")
+case ${1:-} in
+    on) cmd_on ;;
+    off) cmd_off ;;
+    run)
+        shift
+        [[ ${1:-} == -- ]] && shift
+        cmd_run "$@"
+        ;;
+    *) usage ;;
+esac

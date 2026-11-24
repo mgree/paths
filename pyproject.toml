@@ -8,10 +8,22 @@ license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 dependencies = []
 
 [dependency-groups]
-dev = ["pytest==9.2.0", "ruff==0.17.5", "pyright==1.1.414"]  # pinned: formatter output changes between releases
+# Pinned: formatter output changes between releases. pyperf provides
+# `pyperf system tune`, which readies the machine for benchmarks. Releases
+# through 2.11.0 have two bugs that make tune fail here: they can't read
+# version strings like Debian's "7.3.4+deb14-amd64", and on Linux 6.12 and
+# later they stop moving IRQs at the first one that can't be moved. This
+# commit, from the branch paths-main of the fork mgree/pyperf, merges the two
+# fixes proposed to psf/pyperf. Move to the first release with both.
+dev = [
+    "pytest==9.2.0",
+    "ruff==0.17.5",
+    "pyright==1.1.414",
+    "pyperf @ git+https://github.com/mgree/pyperf.git@2c29291874eda5cda2f307fa49caa996509593ea",
+]
 
 [tool.pytest.ini_options]
-testpaths = ["treegen/tests", "protocol/tests", "runner/tests"]
+testpaths = ["treegen/tests", "protocol/tests", "runner/tests", "tools/tests"]
 pythonpath = ["."]
 markers = ["slow: takes much longer than the rest on this host"]
 
