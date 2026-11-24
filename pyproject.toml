@@ -13,13 +13,13 @@ dependencies = []
 # through 2.11.0 have two bugs that make tune fail here: they can't read
 # version strings like Debian's "7.3.4+deb14-amd64", and on Linux 6.12 and
 # later they stop moving IRQs at the first one that can't be moved. This
-# commit, from the branch paths-main of the fork mgree/pyperf, merges the two
-# fixes proposed to psf/pyperf. Move to the first release with both.
+# commit on psf/pyperf's main fixes both (#280 and #281). Move to the first
+# release after 2.11.0.
 dev = [
     "pytest==9.2.0",
     "ruff==0.17.5",
     "pyright==1.1.414",
-    "pyperf @ git+https://github.com/mgree/pyperf.git@2c29291874eda5cda2f307fa49caa996509593ea",
+    "pyperf @ git+https://github.com/psf/pyperf.git@5d1ee0dd5aaa825982401c617638a607c865d203",
 ]
 
 [tool.pytest.ini_options]
@@ -37,7 +37,7 @@ target-version = "py312"
 select = ["E4", "E7", "E9", "F", "B"]
 
 [tool.pyright]
-include = ["treegen", "tools", "protocol", "runner"]
+include = ["treegen", "tools", "protocol", "runner", "harness"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 reportDeprecated = "error"

@@ -518,7 +518,7 @@ def header(started: datetime, tasks: list[Task], options: dict) -> dict:
     commands = {t.driver: t.command for t in tasks}
     return {
         "kind": "check",
-        "started": started.isoformat(timespec="seconds"),
+        "started": started.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "commit": git("rev-parse", "HEAD"),
         "dirty": bool(git("status", "--porcelain")),
         "kernel": platform.release(),
