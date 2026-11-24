@@ -40,6 +40,9 @@ class Sandbox:
         self.root_name = root_name
         self.root = self.path / root_name
         self.mounts: dict[str, str] = {}  # root-relative mount point -> type, in mount order
+        # Mounts beside the root, such as the runner's bind mount of the whole
+        # root: sandbox-relative mount point -> type.
+        self.outer_mounts: dict[str, str] = {}
         os.mkdir(self.root, 0o755)
         os.chmod(self.root, 0o755)
 
@@ -53,7 +56,11 @@ class Sandbox:
 
     def remove(self) -> None:
         # Unmount first, so that removing the sandbox never deletes through a
-        # mount into its source.
+        # mount into its source. The mounts beside the root come off first,
+        # since they can show the root's own mounts.
+        for at in reversed(list(self.outer_mounts)):
+            ns.umount(self.path / at)
+        self.outer_mounts.clear()
         for at in reversed(list(self.mounts)):
             ns.umount(self.root / at)
         self.mounts.clear()
@@ -231,9 +238,10 @@ class Record:
 
 
 def scan(sb: Sandbox) -> list[Record]:
-    """Every entry in the sandbox, sorted by (tree, path). Descends into
-    casefold mounts (the fixture's own entries are there) but not into bind or
-    proc mounts, whose contents are another directory's or the kernel's."""
+    """Return every entry in the sandbox, sorted by (tree, path). The scan goes
+    into casefold mounts, because the fixture's own entries are there. It
+    doesn't go into bind or proc mounts, whose contents are another
+    directory's or the kernel's, wherever those mounts are."""
     records: list[Record] = []
     with opened(sb.path, DIR_FLAGS) as top:
         _scan_dir(top, "", sb, records)
@@ -249,7 +257,7 @@ def _scan_dir(fd: int, prefix: str, sb: Sandbox, records: list[Record]) -> None:
         else:
             tree, path = "outside", rel
         mode, ino = stat.S_IMODE(st.st_mode), (st.st_dev, st.st_ino)
-        mount = sb.mounts.get(path) if tree == "root" else None
+        mount = sb.mounts.get(path) if tree == "root" else sb.outer_mounts.get(path)
         if stat.S_ISLNK(st.st_mode):
             records.append(Record(tree, path, "symlink", None, os.readlink(name, dir_fd=fd), ino))
         elif stat.S_ISREG(st.st_mode):

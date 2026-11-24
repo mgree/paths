@@ -170,10 +170,18 @@ class RootShape(StrEnum):
     SYMLINKED = "symlinked"  # through a symlink to the directory above the root
     DOTTED = "dotted"  # with `.`, `..` and `//`
     ROOT_IS_SYMLINK = "root-is-symlink"
+    # The root is the top of a mount, as a container's root filesystem is.
+    MOUNTED = "mounted"
+
+    @property
+    def needs_mount(self) -> bool:
+        """Return whether this shape mounts something, and so has to run in a
+        namespace of its own."""
+        return self is RootShape.MOUNTED
 
     def path(self, sb: Sandbox, link: Path) -> str:
-        """Make any symlink this shape needs, at link beside the root, and
-        return the path to give the driver."""
+        """Make any symlink or mount this shape needs, at link beside the root,
+        and return the path to give the driver."""
         root = sb.root.name
         match self:
             case RootShape.PLAIN:
@@ -185,6 +193,18 @@ class RootShape(StrEnum):
                 return f"{sb.path}/.//{root}/../{root}"
             case RootShape.ROOT_IS_SYMLINK:
                 os.symlink(root, link)
+                return str(link)
+            case RootShape.MOUNTED:
+                # Bind the root onto a new, empty directory beside it, and give
+                # the driver that directory. The root itself isn't mounted on,
+                # so the build, the racer and the outside snapshot keep using
+                # the root's own path. The racer couldn't go through the mount
+                # anyway: renameat2 refuses to swap entries across mounts. The
+                # bind is recursive, so the fixture's own mounts in the root
+                # show through it.
+                os.mkdir(link)
+                ns.mount(sb.root, link, None, ns.MS_BIND | ns.MS_REC)
+                sb.outer_mounts[link.name] = "bind"
                 return str(link)
 
 
@@ -312,7 +332,7 @@ def _attempt_in_sandbox(task: Task) -> Attempt:
 
 
 def attempt(task: Task) -> Attempt:
-    if task.fixture.mounts:
+    if task.fixture.mounts or task.root_shape.needs_mount:
         return ns.run_in_namespace(_attempt_in_sandbox, task)
     return _attempt_in_sandbox(task)
 
@@ -388,6 +408,8 @@ def run_task(task: Task) -> Result:
         op=fx.request.op,
     )
     why = skip_reason(fx)
+    if not why and task.root_shape.needs_mount and not ns.mounts_available():
+        why = ns.why_no_mounts() or "needs user namespaces"
     if why:
         return result(verdict="skip", reason=why, attempt=None)
     a = attempt(task)
@@ -481,9 +503,15 @@ def run_all(tasks: list[Task], jobs: int) -> Iterator[Result]:
         yield from pool.map(run_task, ordinary, chunksize=1)
     yield from _run_races(ctx, races, jobs)
     # The ALONE fixtures neither mount nor race, so they may run beside each
-    # other.
+    # other, except under a root shape that mounts. Those tasks run one at a
+    # time, last. A task's own mount goes on before its driver starts and comes
+    # off after the driver ends, so it can't disturb the task's own lookup.
+    quiet = [t for t in alone if not t.root_shape.needs_mount]
+    mounting = [t for t in alone if t.root_shape.needs_mount]
     with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
-        yield from pool.map(run_task, alone, chunksize=1)
+        yield from pool.map(run_task, quiet, chunksize=1)
+    with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as pool:
+        yield from pool.map(run_task, mounting, chunksize=1)
 
 
 def _run_races(ctx: BaseContext, races: list[Task], jobs: int) -> Iterator[Result]:

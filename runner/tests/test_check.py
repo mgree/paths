@@ -49,7 +49,7 @@ def verdicts(strategy: str) -> dict[str, check.Result]:
 
 
 # The predictions below are made under the plain root only. That is enough,
-# because test_root_shape_changes_only_the_symlink_budget checks that every
+# because test_root_shape_changes_only_what_we_predict checks that every
 # other shape gives the same outcomes, apart from exceptions none of these
 # predictions involves.
 
@@ -163,12 +163,22 @@ def test_the_alone_fixtures_exist_and_neither_mount_nor_race():
     assert [name for name in check.ALONE if by_name[name].mounts or by_name[name].race] == []
 
 
-def test_root_shape_changes_only_the_symlink_budget():
-    """The path to the root changes no outcome, with one exception. The kernel
-    counts the symlinks on the way to the root toward its limit of 40, so the
-    strategies that hand it root and request together have one hop fewer, and
-    the 40-link chain fails for them with ELOOP. Race fixtures are left out:
-    which outcomes a race produces varies from run to run."""
+def test_root_shape_changes_only_what_we_predict():
+    """The path to the root changes no outcome, with two exceptions.
+
+    The kernel counts the symlinks on the way to the root toward its limit of
+    40. The strategies that hand it root and request together have one hop
+    fewer under the shapes with a symlink in the root's path, and the 40-link
+    chain fails for them with ELOOP.
+
+    Under the mounted shape, the root's path names a mount of the root, so the
+    same directory has two paths. symlink-inside-absolute's link spells the
+    other one. realpath compares paths as strings, sees one that isn't under
+    the root it was given, and refuses. The fixture accepts that (but we see a
+    different outcome than with other root shapes).
+
+    Race fixtures are left out: which outcomes a race produces varies from run
+    to run."""
     racing = {fx.name for fx in FIXTURES if fx.race}
     plain = {(r.strategy, r.fixture): r for r in results()}
     changed = {
@@ -177,9 +187,12 @@ def test_root_shape_changes_only_the_symlink_budget():
         if r.fixture not in racing and outcome(r) != outcome(plain[r.strategy, r.fixture])
     }
     assert changed == {
-        (shape, strategy, "symlink-chain-40"): "wanted ok, got error ELOOP"
-        for shape in (check.RootShape.SYMLINKED, check.RootShape.ROOT_IS_SYMLINK)
-        for strategy in ("string-concat", "logical")
+        **{
+            (shape, strategy, "symlink-chain-40"): "wanted ok, got error ELOOP"
+            for shape in (check.RootShape.SYMLINKED, check.RootShape.ROOT_IS_SYMLINK)
+            for strategy in ("string-concat", "logical")
+        },
+        (check.RootShape.MOUNTED, "realpath", "symlink-inside-absolute"): "got error escape",
     }
 
 
