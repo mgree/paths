@@ -38,6 +38,7 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from enum import StrEnum
+from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Literal
 
@@ -449,10 +450,21 @@ def plan(
     return tasks, unavailable
 
 
+# Fixtures that run after all the others, with nothing else running beside
+# them. Linux counts a symlink chain's links twice when a lookup in RCU mode
+# fails with -ECHILD and is retried, so a chain of 21 to 40 links can fail with
+# ELOOP. A mount or unmount anywhere on the system can cause that failure, and
+# fixtures with mounts mount in their own namespaces while they run. The fix is
+# pending upstream:
+# https://lore.kernel.org/linux-fsdevel/87zeuz5o4j.fsf@hippogriff/T/#u
+# Once kernels with it are common, this can go.
+ALONE = {"symlink-chain-40"}
+
+
 def run_all(tasks: list[Task], jobs: int) -> Iterator[Result]:
-    """Run the tasks in parallel, the race fixtures' tasks last. Results come
-    back in that order, each as soon as it and every task before it have
-    finished.
+    """Run the tasks in parallel: first the ordinary fixtures' tasks, then the
+    race fixtures', then the tasks of the fixtures in ALONE. Results come back
+    in that order, each as soon as it and every task before it have finished.
 
     A racer's renames make the kernel fail scoped `..` steps with EAGAIN
     anywhere on the system, so a race running beside another fixture can change
@@ -462,9 +474,20 @@ def run_all(tasks: list[Task], jobs: int) -> Iterator[Result]:
     # forkserver: workers start single-threaded, so the namespace helper may
     # fork and unshare inside them.
     ctx = multiprocessing.get_context("forkserver")
+    ordinary = [t for t in tasks if not t.fixture.race and t.fixture.name not in ALONE]
+    races = [t for t in tasks if t.fixture.race and t.fixture.name not in ALONE]
+    alone = [t for t in tasks if t.fixture.name in ALONE]
     with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
-        yield from pool.map(run_task, [t for t in tasks if not t.fixture.race], chunksize=1)
-    races = [t for t in tasks if t.fixture.race]
+        yield from pool.map(run_task, ordinary, chunksize=1)
+    yield from _run_races(ctx, races, jobs)
+    # The ALONE fixtures neither mount nor race, so they may run beside each
+    # other.
+    with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
+        yield from pool.map(run_task, alone, chunksize=1)
+
+
+def _run_races(ctx: BaseContext, races: list[Task], jobs: int) -> Iterator[Result]:
+    """Run the race fixtures' tasks, at most one per pair of CPUs."""
     if not races:
         return
     pairs = cpu_pairs()[:jobs]

@@ -154,6 +154,15 @@ def outcome(r: check.Result):
     return (r.verdict, a and (a.failure, kinds, a.outside_changed))
 
 
+def test_the_alone_fixtures_exist_and_neither_mount_nor_race():
+    """A misspelled or renamed fixture in check.ALONE would run beside the
+    others again, and one that mounts or races would disturb the others in
+    ALONE, which run beside each other."""
+    by_name = {fx.name: fx for fx in FIXTURES}
+    assert check.ALONE <= by_name.keys()
+    assert [name for name in check.ALONE if by_name[name].mounts or by_name[name].race] == []
+
+
 def test_root_shape_changes_only_the_symlink_budget():
     """The path to the root changes no outcome, with one exception. The kernel
     counts the symlinks on the way to the root toward its limit of 40, so the
