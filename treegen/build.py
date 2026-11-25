@@ -222,6 +222,22 @@ def build_fixture(fx: Fixture, base: str | Path | None = None) -> Sandbox:
         return sb
 
 
+def free_name(fx: Fixture, name: str) -> str:
+    """Return a name for a new entry in the sandbox, outside the root, that
+    collides with nothing the fixture declares."""
+    while name in fx.outside.entries or name == fx.root_name:
+        name = "_" + name
+    return name
+
+
+def working_dir(fx: Fixture, sb: Sandbox) -> Path:
+    """Make an empty directory in the sandbox, outside the root, for a driver
+    to run in, and return it."""
+    path = sb.path / free_name(fx, "cwd")
+    os.mkdir(path, 0o755)
+    return path
+
+
 # --- reading back ---------------------------------------------------------
 
 

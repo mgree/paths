@@ -280,6 +280,22 @@ def race(
     return invoke(command, "race", args, cwd=cwd, timeout=timeout)
 
 
+def time(
+    command: tuple[str, ...],
+    warmup: float,
+    seconds: float,
+    strategy: str,
+    op: Op,
+    root: str,  # passed as spelled, as for once
+    path: str,
+    *,
+    cwd: Path,
+    timeout: float,
+) -> Run:
+    args = [f"{warmup:g}", f"{seconds:g}", strategy, op, root, path]
+    return invoke(command, "time", args, cwd=cwd, timeout=timeout)
+
+
 def _text(b: bytes | str | None) -> str:
     if b is None:
         return ""

@@ -48,10 +48,12 @@ from treegen.build import (
     DIR_FLAGS,
     Sandbox,
     build_fixture,
+    free_name,
     open_dir,
     opened,
     scan,
     snapshot_outside,
+    working_dir,
 )
 from treegen.spec import Expect, Fixture, Op, Semantics, TreeName, all_fixtures
 
@@ -146,21 +148,6 @@ def _identity(sb: Sandbox, tree: TreeName, rel: str) -> list[int] | None:
     return [st.st_dev, st.st_ino] if stat.S_ISREG(st.st_mode) else None
 
 
-def _free_name(fx: Fixture, name: str) -> str:
-    """A name for a new entry in the sandbox, outside the root, that collides
-    with nothing the fixture declares."""
-    while name in fx.outside.entries or name == fx.root_name:
-        name = "_" + name
-    return name
-
-
-def _working_dir(fx: Fixture, sb: Sandbox) -> Path:
-    """Make an empty directory in the sandbox, outside the root."""
-    path = sb.path / _free_name(fx, "cwd")
-    os.mkdir(path, 0o755)
-    return path
-
-
 class RootShape(StrEnum):
     """How the runner spells the path to the root. Real configurations name
     roots in all these ways, and a correct strategy behaves the same under
@@ -248,8 +235,8 @@ def _claim_cpus(claims) -> None:
 def _attempt_in_sandbox(task: Task) -> Attempt:
     fx = task.fixture
     with build_fixture(fx, task.base) as sb:
-        cwd = _working_dir(fx, sb)
-        root = task.root_shape.path(sb, sb.path / _free_name(fx, "via"))
+        cwd = working_dir(fx, sb)
+        root = task.root_shape.path(sb, sb.path / free_name(fx, "via"))
         # The racer moves names around, so a race fixture's files are looked
         # up before it starts. Without a race they are looked up afterwards, to
         # find a file the call created.
