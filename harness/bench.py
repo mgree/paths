@@ -110,8 +110,9 @@ BASELINE = Cell()
 
 def pin_to_one_cpu() -> dict:
     """Pin this process, and so every driver it starts, to the lowest CPU it
-    may use. Return that CPU and its hyperthread siblings. In bench mode
-    nothing else runs on the partition's CPUs, so the siblings stay idle."""
+    may use. Return that CPU, its hyperthread siblings, and the data caches it
+    uses. In bench mode nothing else runs on the partition's CPUs, so the
+    siblings stay idle."""
     cpu = min(os.sched_getaffinity(0))
     os.sched_setaffinity(0, {cpu})
     siblings = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")
@@ -119,7 +120,7 @@ def pin_to_one_cpu() -> dict:
         sibling_list = siblings.read_text().strip()
     except OSError:
         sibling_list = None
-    return {"cpu": cpu, "thread_siblings": sibling_list}
+    return {"cpu": cpu, "thread_siblings": sibling_list, "caches": system.caches(cpu)}
 
 
 def conditions(cpu: int) -> dict:

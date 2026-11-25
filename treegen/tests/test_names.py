@@ -6,20 +6,9 @@ import unicodedata
 
 import pytest
 
+from treegen.forest import DEFAULT_CHARS
 from treegen.names import CLASSES, NameGen, fold_key, load_lengths
 from treegen.spec import SpecError
-
-DEFAULT_CHARS = {
-    "lower": 60.0,
-    "upper": 10.0,
-    "digit": 10.0,
-    "punct": 10.0,
-    "latin": 4.0,
-    "greek": 2.0,
-    "cyrillic": 2.0,
-    "cjk": 1.0,
-    "emoji": 1.0,
-}
 
 
 def test_class_pools_are_clean():

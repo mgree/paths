@@ -64,6 +64,33 @@ def _pyperf_commit() -> dict:
     return {"url": url["url"], "commit": url["vcs_info"]["commit_id"]}
 
 
+# The units Linux uses for cache sizes in sysfs.
+_SIZE_UNITS = {"K": 1 << 10, "M": 1 << 20, "G": 1 << 30}
+
+
+def caches(cpu: int) -> dict[str, dict]:
+    """Return the data caches a CPU uses, by name (L1d, L2, L3), each with its
+    size in bytes and the CPUs that share it. A CPU uses only its own slice of
+    a split L3, and sysfs gives that slice. Return an empty dictionary if
+    sysfs doesn't describe the CPU's caches."""
+    out = {}
+    for index in sorted(Path(f"/sys/devices/system/cpu/cpu{cpu}/cache").glob("index[0-9]*")):
+        try:
+            level = int((index / "level").read_text())
+            kind = (index / "type").read_text().strip()
+            size = (index / "size").read_text().strip()
+            shared = (index / "shared_cpu_list").read_text().strip()
+        except (OSError, ValueError):
+            continue
+        if kind == "Instruction":
+            continue
+        unit = _SIZE_UNITS.get(size[-1:], 1)
+        number = size[:-1] if size[-1:] in _SIZE_UNITS else size
+        name = f"L{level}d" if kind == "Data" else f"L{level}"
+        out[name] = {"bytes": int(number) * unit, "shared_with": shared}
+    return out
+
+
 def describe(pinned: bool) -> dict:
     """Describe the machine for the results file. Pass pinned=True only when
     the run is in bench mode.

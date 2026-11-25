@@ -45,10 +45,12 @@ slot when a level needs one and has none.
   serve (too deep, too many hops for its link capacity).
 - **Cell**: tree config x query config x strategy x harness settings (cache,
   threads, churn), on one platform and filesystem. One row of results.
-- **Run**: one fresh process measuring one cell on one forest: warm-up, then
-  one measured second. Each cell gets 3 runs on each of the 10 forests.
-  Cold-cache cells use a different protocol (drop caches, time one call,
-  repeat), defined with the harness.
+- **Run**: one fresh process measuring one cell on one forest, in the
+  protocol's time mode: one unmeasured pass through the cell's requests, in
+  an order shuffled from the run's seed, then enough measured passes for at
+  least 100,000 calls (see `protocol/PROTOCOL.md`). Each cell gets 3 runs on
+  each of the 10 forests. Cold-cache cells use a different protocol (drop
+  caches, time one call, repeat), defined with the harness.
 
 ## Layout
 
@@ -94,6 +96,39 @@ Rules:
 - Escape links climb exactly out of their tree: at level k, k+1 `../`
   components, then `outside/<dir>`. `outside/` holds only sentinel files that
   no legitimate query reaches, so reaching one is an unambiguous escape.
+
+## Branching
+
+A tree can branch, so that one query shape is served by many distinct paths.
+Each level k has a **fan-out** f_k: every directory at that level holds f_k
+copies of the level below, each with its own drawn names. Every directory at
+a level carries that level's features, so every branch serves the same
+queries, and links stay inside their own branch.
+
+- Every fan-out 1: a single spine, as above.
+- f_0 = S and the rest 1: S independent spines, sharing only the tree's root.
+- f_b = S and the rest 1: S spines that share their first b levels.
+- Fan-outs of about 6 at several levels, as in the surveyed median width: a
+  tree shaped like a real one, whose upper directories many paths share.
+
+## Working sets
+
+A query's **working set** is the set of distinct dentries its requests touch:
+every prefix of every path, since the paths in the working-set and depth
+sweeps have no links. The working-set levels are sized from the pinned CPU's
+caches, read at the start of a session (half the L2, half the L3 as the
+baseline, twice the L3), at about 256 bytes per dentry. A tree is built for
+its largest level, and each level takes a random subset of its leaves, chosen
+from the seed, adding leaves until the distinct dentries reach the level's
+size. The count is exact, and the header records it for each level.
+Dentries no request touches stay out of the CPU caches, so levels differ
+only in their requests, not their trees. (Later, we can measure cache misses
+with `perf stat`.)
+
+The first version builds what the depth and working-set sweeps need, and no
+more: one tree for each depth level (1, 4, 16, 64, and over `PATH_MAX` with
+200-byte names), each leaf directory holding one target file, and no filler.
+Filler matters most for cold-cache and ext4 lookups, which come later.
 
 ## Trees in a forest
 
