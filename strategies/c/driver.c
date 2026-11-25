@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -271,52 +272,63 @@ static void run_race(const struct call *c, double seconds) {
 // --- requests for time (PROTOCOL.md: a file of NUL-terminated requests) -----
 
 struct requests {
-    char *bytes; // the file, which the requests point into
-    char **v;
+    const char *bytes; // the file, mapped read-only, which the requests point into
+    size_t size;
+    const char **v;
     size_t n;
 };
 
-// Read every request in path. Each one ends with a NUL, so there is one
-// request per NUL, and a file that doesn't end with one is refused.
+// Map every request in path. Each one ends with a NUL, so there is one request
+// per NUL, and a file that doesn't end with one is refused. Counting the
+// requests reads every page, so every page is mapped before the first call;
+// MAP_POPULATE, where there is one, maps them all at once instead.
 static struct requests read_requests(const char *path) {
-    FILE *f = fopen(path, "rb");
-    if (f == NULL) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) < 0) {
         die(path);
     }
-    struct requests r = {0};
-    size_t size = 0, cap = 0;
-    for (;;) {
-        if (size == cap) {
-            cap = cap ? cap * 2 : 1 << 16;
-            if ((r.bytes = realloc(r.bytes, cap)) == NULL) {
-                die("realloc");
-            }
-        }
-        size_t got = fread(r.bytes + size, 1, cap - size, f);
-        size += got;
-        if (got == 0) {
-            break;
-        }
-    }
-    if (ferror(f) || fclose(f) != 0) {
-        die(path);
-    }
-    if (size == 0 || r.bytes[size - 1] != '\0') {
+    // mmap refuses a length of 0, so an empty file is refused before it.
+    if (st.st_size == 0) {
         usage("requests must be NUL-terminated, and there must be at least one");
     }
-    const char *end = r.bytes + size;
-    for (const char *p = r.bytes; p < end; p = (const char *)memchr(p, '\0', end - p) + 1) {
+    int flags = MAP_PRIVATE;
+#ifdef MAP_POPULATE
+    flags |= MAP_POPULATE;
+#endif
+    struct requests r = {.size = (size_t)st.st_size};
+    void *bytes = mmap(NULL, r.size, PROT_READ, flags, fd, 0);
+    if (bytes == MAP_FAILED) {
+        die(path);
+    }
+    r.bytes = bytes;
+    // The mapping outlives the descriptor.
+    if (close(fd) < 0) {
+        die(path);
+    }
+    if (r.bytes[r.size - 1] != '\0') {
+        usage("requests must be NUL-terminated, and there must be at least one");
+    }
+    const char *end = r.bytes + r.size;
+    for (const char *q = r.bytes; (q = memchr(q, '\0', (size_t)(end - q))) != NULL; q++) {
         r.n++;
     }
     if ((r.v = malloc(r.n * sizeof *r.v)) == NULL) {
         die("malloc");
     }
-    char *p = r.bytes;
+    const char *p = r.bytes;
     for (size_t i = 0; i < r.n; i++) {
         r.v[i] = p;
         p += strlen(p) + 1;
     }
     return r;
+}
+
+static void release_requests(struct requests *r) {
+    free(r->v);
+    if (munmap((void *)r->bytes, r->size) < 0) {
+        die("munmap");
+    }
 }
 
 // The generator and the shuffle PROTOCOL.md fixes, so that every driver makes
@@ -328,10 +340,15 @@ static uint64_t splitmix64(uint64_t *state) {
     return z ^ (z >> 31);
 }
 
-static void shuffle(char **v, size_t n, uint64_t *state) {
+static void shuffle(const char **v, size_t n, uint64_t *state) {
+    // No shuffles for singleton and empty lists!
+    if (n < 2) {
+        return;
+    }
+
     for (size_t i = n - 1; i > 0; i--) {
         size_t j = (size_t)(splitmix64(state) % (i + 1));
-        char *t = v[i];
+        const char *t = v[i];
         v[i] = v[j];
         v[j] = t;
     }
@@ -385,11 +402,27 @@ static void list_strategies(void) {
     }
 }
 
+enum mode { ONCE, RACE, TIME };
+
+// Each mode's name, and how many arguments come before <strategy>: the
+// program's name, the mode's, and the mode's own.
+static const struct {
+    const char *name;
+    enum mode mode;
+    int before;
+} modes[] = {
+    {"once", ONCE, 2},
+    {"race", RACE, 3},
+    {"time", TIME, 5},
+};
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         usage("no command");
     }
     const char *cmd = argv[1];
+
+    // detect sub-command
     if (strcmp(cmd, "list") == 0) {
         if (argc != 2) {
             usage("list takes no arguments");
@@ -397,32 +430,43 @@ int main(int argc, char **argv) {
         list_strategies();
         return 0;
     }
-    int fixed; // arguments before <strategy>
-    if (strcmp(cmd, "once") == 0) {
-        fixed = 2;
-    } else if (strcmp(cmd, "race") == 0) {
-        fixed = 3;
-    } else if (strcmp(cmd, "time") == 0) {
-        fixed = 5;
-    } else {
+    size_t m = 0;
+    while (m < sizeof modes / sizeof *modes && strcmp(cmd, modes[m].name) != 0) {
+        m++;
+    }
+    if (m == sizeof modes / sizeof *modes) {
         usage("unknown command");
     }
-    if (argc != fixed + 4) {
+    enum mode mode = modes[m].mode;
+
+    // parse the rest of the arguments
+    int before = modes[m].before;
+    if (argc != before + 4) {
         usage("wrong number of arguments");
     }
-    const char *name = argv[fixed], *op = argv[fixed + 1], *root = argv[fixed + 2];
-    struct call c = {.path = argv[fixed + 3], .flags = parse_op(op)};
-    struct requests r = {0};
+    const char *name = argv[before], *op = argv[before + 1], *root = argv[before + 2];
+    const char *last = argv[before + 3]; // <path>, or the file of <requests>
+    struct call c = {.flags = parse_op(op)};
+    double seconds = 0;
     uint64_t warmup_passes = 0, passes = 0, seed = 0;
-    if (fixed == 5) {
+    switch (mode) {
+    case ONCE:
+        c.path = last;
+        break;
+    case RACE:
+        c.path = last;
+        seconds = parse_seconds(argv[2]);
+        break;
+    case TIME:
         warmup_passes = parse_count(argv[2], "warm-up passes must be a decimal integer");
         passes = parse_count(argv[3], "passes must be a decimal integer");
         seed = parse_count(argv[4], "the seed must be a decimal integer below 2^64");
         if (passes == 0) {
             usage("there must be at least one measured pass");
         }
+        break;
     }
-    if ((c.flags & O_EXCL) && fixed > 2) {
+    if ((c.flags & O_EXCL) && mode != ONCE) {
         usage("race and time do not take newfile");
     }
     if (root[0] != '/') {
@@ -437,24 +481,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s: %s is unavailable: %s\n", NAME, c.s->name, why);
         return 3;
     }
-    if (fixed == 5) {
-        r = read_requests(argv[fixed + 3]);
-    }
     umask(0);
     c.state = c.s->prepare(root);
     if (c.state == NULL) {
         fprintf(stderr, "%s: preparing %s for %s: %s\n", NAME, c.s->name, root, strerror(errno));
         return 1;
     }
-    if (fixed == 2) {
+
+    // let's go!
+    switch (mode) {
+    case ONCE:
         run_once(&c);
-    } else if (fixed == 3) {
-        run_race(&c, parse_seconds(argv[2]));
-    } else {
+        break;
+    case RACE:
+        run_race(&c, seconds);
+        break;
+    case TIME: {
+        struct requests r = read_requests(last);
         run_time(&c, &r, warmup_passes, passes, seed);
-        free(r.v);
-        free(r.bytes);
+        release_requests(&r);
+        break;
     }
+    }
+
     if (c.s->release != NULL) {
         c.s->release(c.state);
     }
