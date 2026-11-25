@@ -6,6 +6,7 @@ import functools
 import warnings
 
 import pytest
+
 from protocol import client
 from runner import check
 from treegen import ns
@@ -58,13 +59,13 @@ def verdicts(strategy: str) -> dict[str, check.Result]:
     "strategy", ["walk-beneath", "walk-in-root", "openat2-walk-beneath", "openat2-walk-in-root"]
 )
 def test_correct_strategies_pass_everything(strategy):
-    failed = {f: r.reason for f, r in verdicts(strategy).items() if r.verdict == "fail"}
+    failed = {f: r.reason for f, r in verdicts(strategy).items() if r.status == "fail"}
     assert failed == {}
 
 
 @pytest.mark.parametrize("strategy", ["openat2-beneath", "openat2-in-root"])
 def test_pure_openat2_fails_only_past_path_max(strategy):
-    failed = {f: r for f, r in verdicts(strategy).items() if r.verdict == "fail"}
+    failed = {f: r for f, r in verdicts(strategy).items() if r.status == "fail"}
     assert set(failed) == {"over-long-path", "over-long-path-dotdot"}
     assert all(r.reason == "wanted ok, got error ENAMETOOLONG" for r in failed.values())
 
@@ -124,7 +125,7 @@ def test_string_concat_fails_every_refusal_fixture():
     concat = verdicts("string-concat")
     for fx in FIXTURES:
         if all(e.result == "refused" for e in fx.expect):
-            assert concat[fx.name].verdict == "fail", fx.name
+            assert concat[fx.name].status == "fail", fx.name
 
 
 def test_no_strategy_makes_the_driver_fail():
@@ -151,7 +152,7 @@ def test_runner_rejects_unknown_names(args, capsys):
 def outcome(r: check.Result):
     a = r.attempt
     kinds = a and sorted((o.ok, o.label or "", o.reached or "") for o in a.outcomes)
-    return (r.verdict, a and (a.failure, kinds, a.outside_changed))
+    return (r.status, a and (a.failure, kinds, a.outside_changed))
 
 
 def test_the_alone_fixtures_exist_and_neither_mount_nor_race():
@@ -199,7 +200,7 @@ def test_root_shape_changes_only_what_we_predict():
 def test_nothing_is_skipped_where_mounts_work():
     if not ns.mounts_available():
         pytest.skip(ns.why_no_mounts() or "")
-    assert [r for r in shape_results() if r.verdict == "skip"] == []
+    assert [r for r in shape_results() if r.status == "skip"] == []
 
 
 REFUSE = parse_fixture(
@@ -231,12 +232,12 @@ def attempt(
 @pytest.mark.parametrize("failure", ["timeout", "signal 11", "exit status 1", "bad output: x"])
 def test_a_driver_failure_is_never_a_refusal(failure):
     verdict, reason = check.judge(REFUSE, "beneath", attempt(failure=failure, label=None))
-    assert verdict == "fail" and failure.partition(":")[0] in reason
+    assert verdict.status == "fail" and failure.partition(":")[0] in reason
 
 
 def test_any_change_outside_fails_even_a_matching_outcome():
     verdict, reason = check.judge(REFUSE, "beneath", attempt(outside_changed=["secret"]))
-    assert verdict == "fail" and reason == "wrote outside: secret"
+    assert verdict == check.Verdict.ESCAPED and reason == "wrote outside: secret"
 
 
 def test_one_bad_call_fails_a_race():
@@ -249,7 +250,8 @@ def test_one_bad_call_fails_a_race():
     a = attempt()
     a.outcomes = calls
     verdict, reason = check.judge(REFUSE, "beneath", a)
-    assert verdict == "fail" and reason == "wanted refused, got ok outside (1 of 1000 calls)"
+    assert verdict == check.Verdict.ESCAPED
+    assert reason == "wanted refused, got ok outside (1 of 1000 calls)"
 
 
 def test_ok_must_reach_the_expected_file():
@@ -264,9 +266,11 @@ def test_ok_must_reach_the_expected_file():
         "t",
     )
     right = attempt(ok=True, label=None, identity=[1, 2], expected_ids={"f": [1, 2]})
-    wrong = attempt(ok=True, label=None, identity=[1, 3], expected_ids={"f": [1, 2]})
-    assert check.judge(fx, "beneath", right)[0] == "pass"
-    assert check.judge(fx, "beneath", wrong)[0] == "fail"
+    wrong = attempt(
+        ok=True, label=None, identity=[1, 3], reached="root:g", expected_ids={"f": [1, 2]}
+    )
+    assert check.judge(fx, "beneath", right)[0] == check.Verdict.PASSED
+    assert check.judge(fx, "beneath", wrong)[0] == check.Verdict.WRONG_FILE
 
 
 def test_errors_compare_by_value():
@@ -279,5 +283,29 @@ def test_errors_compare_by_value():
         },
         "t",
     )
-    assert check.judge(fx, "beneath", attempt(label="EWOULDBLOCK"))[0] == "pass"
-    assert check.judge(fx, "beneath", attempt(label="escape"))[0] == "fail"
+    assert check.judge(fx, "beneath", attempt(label="EWOULDBLOCK"))[0] == check.Verdict.PASSED
+    assert check.judge(fx, "beneath", attempt(label="escape"))[0] == check.Verdict.WRONG_ERROR
+
+
+def test_one_escaping_call_makes_the_verdict_an_escape():
+    """A race where 999 calls refused and one escaped is judged an escape,
+    whatever order the two outcomes come in."""
+    refused = check.Seen(count=999, ok=False, label="ELOOP", identity=None, reached=None)
+    escaped = check.Seen(count=1, ok=True, label=None, identity=[1, 9], reached="outside:secret")
+    a = attempt()
+    for outcomes in ([refused, escaped], [escaped, refused]):
+        a.outcomes = outcomes
+        assert check.judge(REFUSE, "beneath", a)[0] == check.Verdict.ESCAPED
+
+
+def test_the_worst_verdict_among_root_shapes_wins_whatever_order_they_come_in():
+    """Results arrive in the order their attempts finish, which varies from run
+    to run, so combining them must not depend on it."""
+
+    def result(shape, verdict):
+        return check.Result("f", "h", "c", "s", "beneath", shape, "read", verdict, "", None)
+
+    passed = result(check.RootShape.PLAIN, check.Verdict.PASSED)
+    escaped = result(check.RootShape.MOUNTED, check.Verdict.ESCAPED)
+    for results in ([passed, escaped], [escaped, passed]):
+        assert check.worst_verdicts(results) == {("f", ("c", "s")): check.Verdict.ESCAPED}

@@ -48,12 +48,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import os
 import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+from common.color import RED, fade, paint, use_color
 
 THROTTLE_MS = ("core_throttle_ms", "package_throttle_ms")
 
@@ -194,34 +194,6 @@ def spread(values: list[float], widths: list[int]) -> str:
     return f"±<{half:.0f}" if sd < half else f"±{sd:.0f}"
 
 
-# The colors a cell's figure fades through, from the fastest in its column to
-# the slowest, as 24-bit RGB.
-GREEN, YELLOW, RED = (80, 200, 80), (230, 200, 60), (230, 70, 70)
-
-
-def color(text: str, value: float, lo: float, hi: float) -> str:
-    """Return text colored by where value lies between lo and hi on a log
-    scale: green at lo, yellow halfway, red at hi. Colors follow ratios, so
-    figures within a bucket or two of each other get about the same color."""
-    t = 0.0 if hi <= lo else math.log(value / lo) / math.log(hi / lo)
-    a, b, u = (GREEN, YELLOW, 2 * t) if t < 0.5 else (YELLOW, RED, 2 * t - 1)
-    r, g, b_ = (round(x + (y - x) * u) for x, y in zip(a, b, strict=True))
-    return f"\033[38;2;{r};{g};{b_}m{text}\033[0m"
-
-
-def use_color() -> bool:
-    """Return whether to color the output. A non-empty NO_COLOR turns color
-    off (https://no-color.org). Otherwise a non-empty FORCE_COLOR turns it on
-    (https://force-color.org), and without either, the output is colored only
-    on a terminal. NO_COLOR is checked first, as CPython does for its own
-    colored output."""
-    if os.environ.get("NO_COLOR"):
-        return False
-    if os.environ.get("FORCE_COLOR"):
-        return True
-    return sys.stdout.isatty()
-
-
 def describe(runs: list[dict], each_run: bool, colored: bool) -> None:
     """Print a line for each cell: the median, 99th percentile and slowest of
     all its calls, each beside how far apart its runs are on it. Targets are
@@ -235,7 +207,7 @@ def describe(runs: list[dict], each_run: bool, colored: bool) -> None:
     totals = {cell: figures(merged(group)) for cell, group in cells.items()}
     heads = " ".join(f"{h:>6} {'':6}" for h in ("p50 ns", "p99 ns", "max ns"))
     head = f"{'target':6} {'strategy':22} {heads}".rstrip()
-    print(f"\033[1m{head}\033[0m" if colored else head)
+    print(paint(head, colored, bold=True))
     targets = list(dict.fromkeys(target for target, _ in cells))
     for n, target in enumerate(targets):
         if n:
@@ -249,9 +221,7 @@ def describe(runs: list[dict], each_run: bool, colored: bool) -> None:
             each = [figures(r["hist"]) for r in cells[cell]]
             shown = []
             for i, (value, _) in enumerate(totals[cell]):
-                number = f"{value:6.0f}"
-                if colored:
-                    number = color(number, value, *bounds[i])
+                number = fade(f"{value:6.0f}", colored, value, *bounds[i])
                 sd = spread([e[i][0] for e in each], [e[i][1] for e in each])
                 shown.append(f"{number} {sd:<6}")
             print(f"{target:6} {cell[1]:22} {' '.join(shown)}".rstrip())
@@ -275,10 +245,9 @@ def main(argv: list[str] | None = None) -> None:
     if found:
         print(args.results.name)
         print("This session doesn't qualify:")
-        bold_red = "\033[1;38;2;{};{};{}m".format(*RED) if use_color() else ""
-        reset = "\033[0m" if bold_red else ""
+        colored = use_color()
         for why in found:
-            print(f"  {bold_red}{why}{reset}")
+            print(f"  {paint(why, colored, RED, bold=True)}")
         sys.exit(1)
 
     # The session qualified, so every run succeeded at the same recorded

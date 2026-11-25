@@ -32,7 +32,7 @@ import platform
 import stat
 import subprocess
 import sys
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
@@ -42,6 +42,7 @@ from multiprocessing.context import BaseContext
 from pathlib import Path
 from typing import Literal
 
+from common import color
 from protocol import client
 from treegen import ns
 from treegen.build import (
@@ -57,7 +58,8 @@ from treegen.build import (
 )
 from treegen.spec import Expect, Fixture, Op, Semantics, TreeName, all_fixtures
 
-Verdict = Literal["pass", "fail", "skip"]
+# Whether a result passed, failed, or was skipped. Verdict.status gives it.
+Status = Literal["pass", "fail", "skip"]
 
 RESULTS = client.REPO / "results" / "raw"
 DEFAULT_BASE = Path("/dev/shm")
@@ -117,6 +119,55 @@ class Attempt:
     stderr: str
 
 
+class Verdict(StrEnum):
+    """What an attempt did, judged against its fixture's expectations: a
+    character for the report, what it means, and how it is colored. The
+    members run from the worst to the best. Where the report combines several
+    root shapes, it shows the worst verdict among them."""
+
+    meaning: str
+    style: color.Style
+
+    def __new__(cls, char: str, meaning: str, style: color.Style) -> Verdict:
+        member = str.__new__(cls, char)
+        member._value_ = char
+        member.meaning = meaning
+        member.style = style
+        return member
+
+    DRIVER_FAILED = (
+        "!",
+        "the driver failed: a crash, a sanitizer or valgrind report, or bad output",
+        color.Style(color.RED, bold=True),
+    )
+    ESCAPED = (
+        "X",
+        "escaped the root: opened, created or changed a file outside it",
+        color.Style(color.RED, bold=True),
+    )
+    WRONG_FILE = (
+        "I",
+        "opened a file inside the root that it shouldn't have",
+        color.Style(color.RED),
+    )
+    WRONG_ERROR = ("E", "failed with an error it shouldn't have", color.Style(color.YELLOW))
+    TIMED_OUT = ("T", "timed out", color.Style(color.YELLOW))
+    PASSED = (".", "passed", color.Style(color.GREEN))
+    SKIPPED = ("-", "skipped", color.Style(dim=True))
+
+    @property
+    def rank(self) -> int:
+        """Return where the verdict falls from the worst, 0, to the best."""
+        return list(Verdict).index(self)
+
+    @property
+    def status(self) -> Status:
+        """Return whether the verdict is a pass, a failure, or a skip."""
+        if self is Verdict.PASSED:
+            return "pass"
+        return "skip" if self is Verdict.SKIPPED else "fail"
+
+
 @dataclass
 class Result:
     fixture: str
@@ -129,6 +180,10 @@ class Result:
     verdict: Verdict
     reason: str
     attempt: Attempt | None
+
+    @property
+    def status(self) -> Status:
+        return self.verdict.status
 
 
 # --- one attempt ---------------------------------------------------------------
@@ -350,13 +405,15 @@ def _matches(e: Expect, a: Attempt, o: Seen) -> bool:
 
 
 def judge(fx: Fixture, semantics: Semantics, a: Attempt) -> tuple[Verdict, str]:
-    """The verdict, and a short reason such as "wanted refused, got ok outside".
-    Every one of the driver's calls must have an accepted outcome, and nothing
-    outside may change."""
+    """Return the verdict, and a short reason such as "wanted refused, got ok
+    outside". Every one of the driver's calls must have an accepted outcome,
+    and nothing outside may change. When the attempt did several wrong things,
+    the verdict is the worst of them."""
     expects = fx.expect if semantics == "beneath" else fx.expect_in_root
     wanted = f"wanted {' or '.join(_wanted(e) for e in expects)}"
     if a.failure:
-        return "fail", f"{wanted}, got {a.failure.partition(':')[0]}"
+        verdict = Verdict.TIMED_OUT if a.failure == "timeout" else Verdict.DRIVER_FAILED
+        return verdict, f"{wanted}, got {a.failure.partition(':')[0]}"
     calls = sum(o.count for o in a.outcomes)
 
     def got(o: Seen) -> str:
@@ -367,9 +424,16 @@ def judge(fx: Fixture, semantics: Semantics, a: Attempt) -> tuple[Verdict, str]:
     reasons = [f"{wanted}, got {got(bad[0])}"] if bad else []
     if wrote:
         reasons.append(f"wrote outside: {', '.join(wrote)}")
-    if reasons:
-        return "fail", ", ".join(reasons)
-    return "pass", "got " + ", ".join(got(o) for o in a.outcomes)
+    if not reasons:
+        return Verdict.PASSED, "got " + ", ".join(got(o) for o in a.outcomes)
+    kinds = {_got(o) for o in bad}
+    if wrote or kinds & {"ok outside", "ok elsewhere"}:
+        verdict = Verdict.ESCAPED
+    elif "ok in root" in kinds:
+        verdict = Verdict.WRONG_FILE
+    else:
+        verdict = Verdict.WRONG_ERROR
+    return verdict, ", ".join(reasons)
 
 
 def skip_reason(fx: Fixture) -> str | None:
@@ -398,7 +462,7 @@ def run_task(task: Task) -> Result:
     if not why and task.root_shape.needs_mount and not ns.mounts_available():
         why = ns.why_no_mounts() or "needs user namespaces"
     if why:
-        return result(verdict="skip", reason=why, attempt=None)
+        return result(verdict=Verdict.SKIPPED, reason=why, attempt=None)
     a = attempt(task)
     verdict, reason = judge(fx, task.semantics, a)
     return result(verdict=verdict, reason=reason, attempt=a)
@@ -439,7 +503,7 @@ def plan(
                         unavailable.append(
                             Result(
                                 fx.name, fx.hazard, d.name, s.name, s.semantics, shape,
-                                fx.request.op, "skip", f"unavailable: {s.unavailable}", None,
+                                fx.request.op, Verdict.SKIPPED, f"unavailable: {s.unavailable}", None,
                             )
                         )  # fmt: skip
                         continue
@@ -557,22 +621,165 @@ def driver_failures(results: list[Result]) -> list[Result]:
     return [r for r in results if r.attempt and r.attempt.failure not in (None, "timeout")]
 
 
-def report(results: list[Result]) -> str:
-    """Per strategy: how many fixtures it passed, and what went wrong where."""
+# How the report names each op.
+OP_NAMES = {"read": "read", "write": "write", "newfile": "new"}
+
+
+def _judged(
+    cell: dict[tuple[str, Column], Verdict],
+    fixtures: list[str],
+    columns: list[tuple[str, str]],
+) -> list[int]:
+    """Return how many fixtures each column judged, rather than skipped."""
+    return [
+        sum(cell.get((f, c), Verdict.SKIPPED) != Verdict.SKIPPED for f in fixtures) for c in columns
+    ]
+
+
+def _abbreviations(columns: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
+    """Return a short name for each (driver, strategy) column: the initials of
+    the strategy's words, after the driver's name if there is more than one
+    driver, and with a number after it if two columns would share it."""
+    drivers = {d for d, _ in columns}
+    names: dict[tuple[str, str], str] = {}
+    for d, st in columns:
+        name = (f"{d}:" if len(drivers) > 1 else "") + "".join(w[0] for w in st.split("-"))
+        taken = set(names.values())
+        n, base = 2, name
+        while name in taken:
+            name, n = f"{base}{n}", n + 1
+        names[d, st] = name
+    return names
+
+
+Column = tuple[str, str]  # (driver, strategy)
+
+
+def worst_verdicts(results: list[Result]) -> dict[tuple[str, Column], Verdict]:
+    """Return, for each fixture and strategy, the worst verdict among its
+    results: one for each root shape."""
+    combined: dict[tuple[str, Column], Verdict] = {}
+    for r in results:
+        key = (r.fixture, (r.driver, r.strategy))
+        old = combined.get(key)
+        if old is None or r.verdict.rank < old.rank:
+            combined[key] = r.verdict
+    return combined
+
+
+def report(results: list[Result], colored: bool) -> str:
+    """Return a table with a row for each fixture some strategy didn't pass,
+    grouped by hazard, and a column for each strategy. Each cell is the
+    character of the worst verdict among the root shapes. Below the table are a count of the other fixtures, how many
+    fixtures each strategy passed, and a key to the marks and names."""
+    columns = list(dict.fromkeys((r.driver, r.strategy) for r in results))
+    names = _abbreviations(columns)
+    shapes = list(dict.fromkeys(r.root_shape for r in results))
+    cell = worst_verdicts(results)
+    hazard: dict[str, str] = {}
+    op: dict[str, str] = {}
+    for r in results:
+        hazard[r.fixture] = r.hazard
+        op[r.fixture] = OP_NAMES[r.op]
+    fixtures = sorted(hazard, key=lambda f: (hazard[f], f))
+
+    # Put the strategies that pass the smallest share of the fixtures they
+    # were judged on at the left, and those that pass the largest at the
+    # right. Strategies with equal shares keep the order the drivers list them.
+    def share(c: tuple[str, str]) -> float:
+        judged = sum(cell.get((f, c), Verdict.SKIPPED) != Verdict.SKIPPED for f in fixtures)
+        passed = sum(cell.get((f, c)) == Verdict.PASSED for f in fixtures)
+        return passed / judged if judged else 1.0
+
+    columns.sort(key=share)
+
+    def marks(f: str) -> list[Verdict]:
+        return [cell.get((f, c), Verdict.SKIPPED) for c in columns]
+
+    shown = [
+        f for f in fixtures if any(m not in (Verdict.PASSED, Verdict.SKIPPED) for m in marks(f))
+    ]
+    skipped = [f for f in fixtures if all(m == Verdict.SKIPPED for m in marks(f))]
+    widths = [max(2, len(names[c])) for c in columns]
+    judged = _judged(cell, fixtures, columns)
+    passes = f"passes (of {judged[0]})" if len(set(judged)) == 1 else "passes"
+    label = max([len(passes), *(2 + len(f) for f in shown), *(len(hazard[f]) for f in shown)])
+
+    def row(
+        head: str, how: str, cells: Sequence[str], styles: list[color.Style] | None = None
+    ) -> str:
+        styles = styles or [color.Style()] * len(cells)
+        padded = [
+            color.styled(c.rjust(w), colored, st)
+            for c, w, st in zip(cells, widths, styles, strict=True)
+        ]
+        return f"{head:<{label}} {how:<5} {' '.join(padded)}".rstrip()
+
+    lines = [color.paint(row("", "op", [names[c] for c in columns]), colored, bold=True)]
+    group = None
+    for f in shown:
+        if hazard[f] != group:
+            group = hazard[f]
+            lines.append(group)
+        ms = marks(f)
+        lines.append(row(f"  {f}", op[f], ms, [m.style for m in ms]))
+    rest = len(fixtures) - len(shown) - len(skipped)
+    if rest:
+        lines.append(f"{rest} other fixtures pass under every strategy")
+    if skipped:
+        lines.append(f"{len(skipped)} fixtures are skipped under every strategy")
+    passed = [sum(cell.get((f, c)) == Verdict.PASSED for f in fixtures) for c in columns]
+    # Color each count by the share of its fixtures the strategy passed: the
+    # best share in the row is green and the worst is red.
+    shares = [n / j if j else 1.0 for n, j in zip(passed, judged, strict=True)]
+    best, worst = max(shares), min(shares)
+    styles = [
+        color.Style(color.on_scale((best - x) / (best - worst) if best > worst else 0.0))
+        for x in shares
+    ]
+    lines.append(row(passes, "", [str(n) for n in passed], styles))
+    if len(set(judged)) > 1:
+        lines.append(row("of", "", [str(n) for n in judged]))
+
+    lines.append("")
+    used = {m for f in fixtures for m in marks(f)}
+    for m in Verdict:
+        if m in used:
+            lines.append(f"{color.styled(m, colored, m.style)}  {m.meaning}")
+    if len(shapes) > 1:
+        lines.append(
+            "Each mark is the worst verdict among the root shapes "
+            + ", ".join(str(sh) for sh in shapes)
+            + "."
+        )
+    key = [f"{names[c]} {c[0] + '/' if names[c].count(':') else ''}{c[1]}" for c in columns]
+    line = ""
+    for k in key:
+        if line and len(line) + 2 + len(k) > 100:
+            lines.append(line)
+            line = ""
+        line = f"{line}  {k}" if line else k
+    lines.append(line)
+    return "\n".join(lines)
+
+
+def details(results: list[Result]) -> str:
+    """Return, for each strategy and root shape, how many fixtures it passed,
+    and what went wrong where."""
     lines = []
     by_strategy: dict[tuple[str, str, RootShape], list[Result]] = {}
     for r in results:
         by_strategy.setdefault((r.driver, r.strategy, r.root_shape), []).append(r)
-    width = max((len(r.fixture) for r in results if r.verdict == "fail"), default=0)
+    width = max((len(r.fixture) for r in results if r.status == "fail"), default=0)
     for (d, s, shape), rs in by_strategy.items():
-        judged = [r for r in rs if r.verdict != "skip"]
-        passed = sum(r.verdict == "pass" for r in judged)
+        judged = [r for r in rs if r.status != "skip"]
+        passed = sum(r.status == "pass" for r in judged)
         skipped = len(rs) - len(judged)
         note = f", {skipped} skipped" if skipped else ""
         label = f"{d}/{s}" if shape is RootShape.PLAIN else f"{d}/{s} (root shape: {shape})"
         lines.append(f"{label}: passes {passed}/{len(judged)}{note}")
         for r in judged:
-            if r.verdict == "fail":
+            if r.status == "fail":
                 lines.append(f"  {r.fixture:<{width}}  {r.reason}")
     return "\n".join(lines)
 
@@ -601,6 +808,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument(
         "--out", type=Path, help="results file (default: results/raw/check-<start>.jsonl)"
+    )
+    p.add_argument(
+        "--details", action="store_true", help="also list each failure with what happened"
     )
     args = p.parse_args(argv)
 
@@ -652,7 +862,10 @@ def main(argv: list[str] | None = None) -> int:
         for r in itertools.chain(run_all(tasks, args.jobs), unavailable):
             f.write(json.dumps(asdict(r)) + "\n")
             results.append(r)
-    print(report(results))
+    print(report(results, color.use_color()))
+    if args.details:
+        print()
+        print(details(results))
     print(f"\nresults: {out}")
     broken = driver_failures(results)
     if broken:
