@@ -1,0 +1,21 @@
+hazard = "Symlink escape"
+about = """O_EXCL guards only the last component, as O_NOFOLLOW does, so newfile through a \
+symlinked middle directory creates a file outside the root. Contrast \
+dangling-symlink-newfile, where the symlink is the last component and O_EXCL refuses it."""
+
+[root]
+symlinks = { "d" = "../outside-dir" }
+
+[outside]
+dirs = ["outside-dir"]
+
+[request]
+op = "newfile"
+path = "d/new"
+
+[expect]
+result = "refused"
+
+[expect.in_root]
+result = "error"
+errno = "ENOENT"   # .. clamps at the root, and root/outside-dir doesn't exist
