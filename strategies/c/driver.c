@@ -4,9 +4,9 @@
 // specifies.
 //
 //   driver list
-//   driver once                    <strategy> <op> <root> <path>
-//   driver race          <seconds> <strategy> <op> <root> <path>
-//   driver time <warmup> <seconds> <strategy> <op> <root> <path>
+//   driver once                                 <strategy> <op> <root> <path>
+//   driver race                       <seconds> <strategy> <op> <root> <path>
+//   driver time <warmup-passes> <passes> <seed> <strategy> <op> <root> <requests>
 //
 // Exit status: 0 when the command ran (a strategy's errors are outcomes);
 // 2 for bad arguments; 3 for a strategy this host cannot run; 1 for anything
@@ -35,9 +35,9 @@ static _Noreturn void usage(const char *why) {
     fprintf(stderr,
             "%s: %s\n"
             "usage: %s list\n"
-            "       %s once                    <strategy> <op> <root> <path>\n"
-            "       %s race          <seconds> <strategy> <op> <root> <path>\n"
-            "       %s time <warmup> <seconds> <strategy> <op> <root> <path>\n",
+            "       %s once                                 <strategy> <op> <root> <path>\n"
+            "       %s race                       <seconds> <strategy> <op> <root> <path>\n"
+            "       %s time <warmup-passes> <passes> <seed> <strategy> <op> <root> <requests>\n",
             NAME, why, NAME, NAME, NAME, NAME);
     exit(2);
 }
@@ -64,6 +64,18 @@ static double parse_seconds(const char *s) {
     return v;
 }
 
+// Parse a decimal integer from 0 to 2^64 - 1. strtoull alone would accept a
+// sign and leading spaces, so the first character must be a digit.
+static uint64_t parse_count(const char *s, const char *what) {
+    char *end;
+    errno = 0;
+    unsigned long long v = strtoull(s, &end, 10);
+    if (s[0] < '0' || s[0] > '9' || errno != 0 || *end != '\0') {
+        usage(what);
+    }
+    return v;
+}
+
 static int parse_op(const char *op) {
     if (strcmp(op, "read") == 0) {
         return O_RDONLY | O_CLOEXEC;
@@ -86,6 +98,34 @@ static const struct strategy *find(const char *name) {
     return NULL;
 }
 
+// --- histogram (PROTOCOL.md: 1 ns buckets below 16 ns, then 16 per power of 2)
+
+#define BUCKETS (16 + (64 - 4) * 16)
+
+static size_t bucket(uint64_t v) {
+    if (v < 16) {
+        return (size_t)v;
+    }
+    int k = 63 - __builtin_clzll(v); // 63 - # of leading 0 bits
+    //                  16: skips first 16 buckets for individual ns
+    //        (k - 4) * 16: skips 16 buckets for each power of 2 from 16 to v's
+    // (v >> (k - 4)) & 15: selects which of the 16 buckets at this level
+    return 16 + (size_t)(k - 4) * 16 + (size_t)((v >> (k - 4)) & 15);
+}
+
+// Returns the lowest value in a given bucket index
+static uint64_t bucket_lower(size_t i) {
+    // first 16 are individual ns values
+    if (i < 16) {
+        return i;
+    }
+    //   k: position of leading 1 bit (which power of 2 range are we in)
+    // sub: which of the 16 buckets at this level
+    size_t k = (i - 16) / 16 + 4, sub = (i - 16) % 16;
+    // Put leading 1 back above sub, shift both up to range k, leaving the rest 0.
+    return (uint64_t)(16 + sub) << (k - 4);
+}
+
 // --- outcomes ---------------------------------------------------------------
 
 struct outcome {
@@ -95,6 +135,7 @@ struct outcome {
     ino_t ino;
     char label[32];
     uint64_t count;
+    uint64_t *hist; // BUCKETS counts in time mode, NULL otherwise
 };
 
 struct outcomes {
@@ -115,17 +156,18 @@ static void error_label(char out[32], int err, const char *label) {
     }
 }
 
-// Add one outcome to the tally. The search is linear, which is fine for the few
-// distinct outcomes a run usually has.
+// Add one outcome to the tally, and return the tallied outcome. The search is
+// linear, which is fine for the few distinct outcomes a run usually has. If
+// with_hist is true, a new outcome gets a histogram of its own.
 //
 // TODO: We can speed this up with a hashtable if races aren't racy enough.
-static void count(struct outcomes *os, const struct outcome *o) {
+static struct outcome *count(struct outcomes *os, const struct outcome *o, bool with_hist) {
     for (size_t i = 0; i < os->n; i++) {
         struct outcome *x = &os->v[i];
         if (x->ok == o->ok && x->dev == o->dev &&
             x->ino == o->ino && strcmp(x->label, o->label) == 0) {
             x->count++;
-            return;
+            return x;
         }
     }
     if (os->n == os->cap) {
@@ -135,9 +177,21 @@ static void count(struct outcomes *os, const struct outcome *o) {
             die("realloc");
         }
     }
-    os->v[os->n] = *o;
-    os->v[os->n].count = 1;
-    os->n++;
+    struct outcome *x = &os->v[os->n++];
+    *x = *o;
+    x->count = 1;
+    x->hist = NULL;
+    if (with_hist && (x->hist = calloc(BUCKETS, sizeof *x->hist)) == NULL) {
+        die("calloc");
+    }
+    return x;
+}
+
+static void free_outcomes(struct outcomes *os) {
+    for (size_t i = 0; i < os->n; i++) {
+        free(os->v[i].hist);
+    }
+    free(os->v);
 }
 
 static void print_outcomes(const struct outcomes *os, bool identify) {
@@ -191,34 +245,6 @@ static struct outcome one_call(const struct call *c, uint64_t *paused) {
     return o;
 }
 
-// --- histogram (PROTOCOL.md: 1 ns buckets below 16 ns, then 16 per power of 2)
-
-#define BUCKETS (16 + (64 - 4) * 16)
-
-static size_t bucket(uint64_t v) {
-    if (v < 16) {
-        return (size_t)v;
-    }
-    int k = 63 - __builtin_clzll(v); // 63 - # of leading 0 bits
-    //                  16: skips first 16 buckets for individual ns
-    //        (k - 4) * 16: skips 16 buckets for each power of 2 from 16 to v's
-    // (v >> (k - 4)) & 15: selects which of the 16 buckets at this level
-    return 16 + (size_t)(k - 4) * 16 + (size_t)((v >> (k - 4)) & 15);
-}
-
-// Returns the lowest value in a given bucket index
-static uint64_t bucket_lower(size_t i) {
-    // first 16 are individual ns values
-    if (i < 16) {
-        return i;
-    }
-    //   k: position of leading 1 bit (which power of 2 range are we in)
-    // sub: which of the 16 buckets at this level
-    size_t k = (i - 16) / 16 + 4, sub = (i - 16) % 16;
-    // Put leading 1 back above sub, shift both up to range k, leaving the rest 0.
-    return (uint64_t)(16 + sub) << (k - 4);
-}
-
 // --- modes ------------------------------------------------------------------
 
 static void run_once(const struct call *c) {
@@ -236,38 +262,115 @@ static void run_race(const struct call *c, double seconds) {
     uint64_t paused = 0; // race doesn't time calls, but passing it makes one_call fstat
     do {
         struct outcome o = one_call(c, &paused);
-        count(&os, &o);
+        count(&os, &o, false);
     } while (now_ns() < deadline);
     print_outcomes(&os, true);
-    free(os.v);
+    free_outcomes(&os);
 }
 
-static void run_time(const struct call *c, double warmup, double seconds) {
-    uint64_t t = now_ns(), stop = t + (uint64_t)(warmup * 1e9);
-    while (t < stop) {
-        one_call(c, NULL);
-        t = now_ns();
+// --- requests for time (PROTOCOL.md: a file of NUL-terminated requests) -----
+
+struct requests {
+    char *bytes; // the file, which the requests point into
+    char **v;
+    size_t n;
+};
+
+// Read every request in path. Each one ends with a NUL, so there is one
+// request per NUL, and a file that doesn't end with one is refused.
+static struct requests read_requests(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) {
+        die(path);
     }
-    struct outcomes os = {0};
-    static uint64_t hist[BUCKETS];
-    uint64_t total = 0;
-    stop = t + (uint64_t)(seconds * 1e9);
-    do {
-        uint64_t t0 = now_ns();
-        struct outcome o = one_call(c, NULL);
-        t = now_ns();
-        total += t - t0;
-        hist[bucket(t - t0)]++;
-        count(&os, &o);
-    } while (t < stop);
-    print_outcomes(&os, false);
-    printf("TIME %" PRIu64 "\n", total);
-    for (size_t i = 0; i < BUCKETS; i++) {
-        if (hist[i] != 0) {
-            printf("HIST %" PRIu64 " %" PRIu64 "\n", bucket_lower(i), hist[i]);
+    struct requests r = {0};
+    size_t size = 0, cap = 0;
+    for (;;) {
+        if (size == cap) {
+            cap = cap ? cap * 2 : 1 << 16;
+            if ((r.bytes = realloc(r.bytes, cap)) == NULL) {
+                die("realloc");
+            }
+        }
+        size_t got = fread(r.bytes + size, 1, cap - size, f);
+        size += got;
+        if (got == 0) {
+            break;
         }
     }
-    free(os.v);
+    if (ferror(f) || fclose(f) != 0) {
+        die(path);
+    }
+    if (size == 0 || r.bytes[size - 1] != '\0') {
+        usage("requests must be NUL-terminated, and there must be at least one");
+    }
+    const char *end = r.bytes + size;
+    for (const char *p = r.bytes; p < end; p = (const char *)memchr(p, '\0', end - p) + 1) {
+        r.n++;
+    }
+    if ((r.v = malloc(r.n * sizeof *r.v)) == NULL) {
+        die("malloc");
+    }
+    char *p = r.bytes;
+    for (size_t i = 0; i < r.n; i++) {
+        r.v[i] = p;
+        p += strlen(p) + 1;
+    }
+    return r;
+}
+
+// The generator and the shuffle PROTOCOL.md fixes, so that every driver makes
+// the same calls in the same order for the same seed.
+static uint64_t splitmix64(uint64_t *state) {
+    uint64_t z = (*state += 0x9E3779B97F4A7C15u);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9u;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBu;
+    return z ^ (z >> 31);
+}
+
+static void shuffle(char **v, size_t n, uint64_t *state) {
+    for (size_t i = n - 1; i > 0; i--) {
+        size_t j = (size_t)(splitmix64(state) % (i + 1));
+        char *t = v[i];
+        v[i] = v[j];
+        v[j] = t;
+    }
+}
+
+static void run_time(const struct call *c, struct requests *r, uint64_t warmup_passes,
+                     uint64_t passes, uint64_t seed) {
+    struct call k = *c;
+    uint64_t state = seed;
+    for (uint64_t pass = 0; pass < warmup_passes; pass++) {
+        shuffle(r->v, r->n, &state);
+        for (size_t i = 0; i < r->n; i++) {
+            k.path = r->v[i];
+            one_call(&k, NULL);
+        }
+    }
+    struct outcomes os = {0};
+    uint64_t total = 0;
+    for (uint64_t pass = 0; pass < passes; pass++) {
+        shuffle(r->v, r->n, &state);
+        for (size_t i = 0; i < r->n; i++) {
+            k.path = r->v[i];
+            uint64_t t0 = now_ns();
+            struct outcome o = one_call(&k, NULL);
+            uint64_t took = now_ns() - t0;
+            total += took;
+            count(&os, &o, true)->hist[bucket(took)]++;
+        }
+    }
+    print_outcomes(&os, false);
+    printf("TIME %" PRIu64 "\n", total);
+    for (size_t o = 0; o < os.n; o++) {
+        for (size_t i = 0; i < BUCKETS; i++) {
+            if (os.v[o].hist[i] != 0) {
+                printf("HIST %zu %" PRIu64 " %" PRIu64 "\n", o, bucket_lower(i), os.v[o].hist[i]);
+            }
+        }
+    }
+    free_outcomes(&os);
 }
 
 static void list_strategies(void) {
@@ -300,7 +403,7 @@ int main(int argc, char **argv) {
     } else if (strcmp(cmd, "race") == 0) {
         fixed = 3;
     } else if (strcmp(cmd, "time") == 0) {
-        fixed = 4;
+        fixed = 5;
     } else {
         usage("unknown command");
     }
@@ -309,6 +412,16 @@ int main(int argc, char **argv) {
     }
     const char *name = argv[fixed], *op = argv[fixed + 1], *root = argv[fixed + 2];
     struct call c = {.path = argv[fixed + 3], .flags = parse_op(op)};
+    struct requests r = {0};
+    uint64_t warmup_passes = 0, passes = 0, seed = 0;
+    if (fixed == 5) {
+        warmup_passes = parse_count(argv[2], "warm-up passes must be a decimal integer");
+        passes = parse_count(argv[3], "passes must be a decimal integer");
+        seed = parse_count(argv[4], "the seed must be a decimal integer below 2^64");
+        if (passes == 0) {
+            usage("there must be at least one measured pass");
+        }
+    }
     if ((c.flags & O_EXCL) && fixed > 2) {
         usage("race and time do not take newfile");
     }
@@ -324,6 +437,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "%s: %s is unavailable: %s\n", NAME, c.s->name, why);
         return 3;
     }
+    if (fixed == 5) {
+        r = read_requests(argv[fixed + 3]);
+    }
     umask(0);
     c.state = c.s->prepare(root);
     if (c.state == NULL) {
@@ -335,7 +451,9 @@ int main(int argc, char **argv) {
     } else if (fixed == 3) {
         run_race(&c, parse_seconds(argv[2]));
     } else {
-        run_time(&c, parse_seconds(argv[2]), parse_seconds(argv[3]));
+        run_time(&c, &r, warmup_passes, passes, seed);
+        free(r.v);
+        free(r.bytes);
     }
     if (c.s->release != NULL) {
         c.s->release(c.state);

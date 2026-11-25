@@ -4,6 +4,7 @@ follow the protocol."""
 
 import errno
 import os
+from datetime import timedelta
 
 import pytest
 from protocol import client
@@ -16,7 +17,8 @@ from treegen.build import Sandbox
         ("OUTCOME 1 ok 29 1234\nTIME 5\n", "once"),
         ("OUTCOME 1 error ENOENT\nTIME 5\n", "once"),
         ("OUTCOME 3 ok 29 1\nOUTCOME 2 error escape\n", "race"),
-        ("OUTCOME 4 ok\nTIME 400\nHIST 96 3\nHIST 104 1\n", "time"),
+        ("OUTCOME 4 ok\nTIME 400\nHIST 0 96 3\nHIST 0 104 1\n", "time"),
+        ("OUTCOME 1 error ENOENT\nOUTCOME 2 ok\nTIME 400\nHIST 0 96 1\nHIST 1 96 2\n", "time"),
     ],
 )
 def test_parses_what_the_protocol_allows(stdout, mode):
@@ -31,10 +33,19 @@ def test_parses_what_the_protocol_allows(stdout, mode):
         ("OUTCOME 1 ok 29 1234\n", "once", "TIME is expected"),
         ("OUTCOME 2 ok 29 1234\nTIME 5\n", "once", "exactly one call"),
         ("OUTCOME 1 ok\nTIME 5\n", "once", "need dev ino"),
-        ("OUTCOME 1 ok 29 1\nTIME 5\nHIST 1 1\n", "once", "HIST lines are not"),
+        ("OUTCOME 1 ok 29 1\nTIME 5\nHIST 0 1 1\n", "once", "HIST lines are not"),
         ("OUTCOME 1 ok 29 1\nTIME 5\n", "race", "TIME is not"),
-        ("OUTCOME 4 ok 29 1\nTIME 400\nHIST 96 4\n", "time", "take no dev ino"),
-        ("OUTCOME 4 ok\nTIME 400\nHIST 96 3\n", "time", "do not add up"),
+        ("OUTCOME 4 ok 29 1\nTIME 400\nHIST 0 96 4\n", "time", "take no dev ino"),
+        ("OUTCOME 4 ok\nTIME 400\nHIST 0 96 3\n", "time", "do not add up"),
+        # The total is right, but the calls are counted against the wrong outcome.
+        (
+            "OUTCOME 1 error ENOENT\nOUTCOME 2 ok\nTIME 4\nHIST 0 96 2\nHIST 1 96 1\n",
+            "time",
+            "do not add up",
+        ),
+        ("OUTCOME 2 ok\nTIME 4\nHIST 0 96 1\nHIST 1 96 1\n", "time", "isn't there"),
+        ("OUTCOME 2 ok\nTIME 4\nHIST 0 104 1\nHIST 0 96 1\n", "time", "out of order"),
+        ("OUTCOME 4 ok\nTIME 400\nHIST 96 4\n", "time", "unexpected line"),
         ("OUTCOME 1 ok 29 1\nTIME 5\nhello\n", "once", "unexpected line"),
         ("OUTCOME 01 ok 29 1\nTIME 5\n", "once", "unexpected line"),
         ("OUTCOME 1 error has space\nTIME 5\n", "once", "unexpected line"),
@@ -103,6 +114,12 @@ def test_a_hang_is_a_timeout(tmp_path):
     with Sandbox(tmp_path) as sb:
         os.mkfifo(sb.root / "p")
         run = client.once(
-            c.check_command, "string-concat", "read", str(sb.root), "p", cwd=tmp_path, timeout=0.5
+            c.check_command,
+            "string-concat",
+            "read",
+            str(sb.root),
+            "p",
+            cwd=tmp_path,
+            timeout=timedelta(seconds=0.5),
         )
     assert run.failure == "timeout"

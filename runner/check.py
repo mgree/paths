@@ -36,7 +36,7 @@ from collections.abc import Iterator, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from multiprocessing.context import BaseContext
 from pathlib import Path
@@ -89,8 +89,8 @@ class Task:
     semantics: Semantics
     root_shape: RootShape
     base: str
-    timeout: float  # beyond the race, for a race fixture
-    race_seconds: float  # how long a race fixture's driver races
+    timeout: timedelta  # beyond the race, for a race fixture
+    race_length: timedelta  # how long a race fixture's driver races
 
 
 @dataclass
@@ -300,10 +300,10 @@ def _attempt_in_sandbox(task: Task) -> Attempt:
         args = (task.strategy, fx.request.op, root, fx.request.path)
         swaps, racer_failure, racer_err = None, None, ""
         if fx.race:
-            driver_limit = task.race_seconds + task.timeout
+            driver_limit = task.race_length + task.timeout
             # The runner stops the racer once the driver is done. The limit only
             # matters if the runner dies first, so it is well past the driver's.
-            limit = math.ceil(driver_limit + task.timeout)
+            limit = math.ceil((driver_limit + task.timeout).total_seconds())
             with ExitStack() as stack:
                 racer_args, fds = [], []
                 for tree, path in fx.race.exchange:
@@ -332,12 +332,12 @@ def _attempt_in_sandbox(task: Task) -> Attempt:
                     os.sched_setaffinity(0, {_race_cpus[0]})
             try:
                 run = client.race(
-                    task.command, task.race_seconds, *args, cwd=cwd, timeout=driver_limit
+                    task.command, task.race_length, *args, cwd=cwd, timeout=driver_limit
                 )
             finally:
                 racer.terminate()
                 try:
-                    out, racer_err = racer.communicate(timeout=task.timeout)
+                    out, racer_err = racer.communicate(timeout=task.timeout.total_seconds())
                 except subprocess.TimeoutExpired:
                     racer.kill()
                     out, racer_err = racer.communicate()
@@ -480,11 +480,11 @@ def plan(
     fixtures: list[Fixture],
     strategies: set[str] | None,
     base: str,
-    timeout: float,
+    timeout: timedelta,
     *,
     valgrind: bool,
     root_shapes: tuple[RootShape, ...],
-    race_seconds: float,
+    race_length: timedelta,
 ) -> tuple[list[Task], list[Result]]:
     """Return the attempts to make, and a result for each strategy this host
     can't run."""
@@ -517,7 +517,7 @@ def plan(
                             shape,
                             base,
                             timeout,
-                            race_seconds,
+                            race_length,
                         )
                     )
     return tasks, unavailable
@@ -849,10 +849,10 @@ def main(argv: list[str] | None = None) -> int:
         fixtures,
         strategies,
         args.base,
-        args.timeout,
+        timedelta(seconds=args.timeout),
         valgrind=args.valgrind,
         root_shapes=root_shapes,
-        race_seconds=args.race_seconds,
+        race_length=timedelta(seconds=args.race_seconds),
     )
     out = args.out or RESULTS / f"check-{started:%Y%m%dT%H%M%SZ}.jsonl"
     out.parent.mkdir(parents=True, exist_ok=True)

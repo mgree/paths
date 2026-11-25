@@ -11,9 +11,9 @@ A given driver command `DRIVER` takes the following command-line arguments:
 
 ```
 DRIVER list
-DRIVER once                    <strategy> <op> <root> <path>
-DRIVER race          <seconds> <strategy> <op> <root> <path>
-DRIVER time <warmup> <seconds> <strategy> <op> <root> <path>
+DRIVER once                                 <strategy> <op> <root> <path>
+DRIVER race                       <seconds> <strategy> <op> <root> <path>
+DRIVER time <warmup-passes> <passes> <seed> <strategy> <op> <root> <requests>
 ```
 
 There are four modes:
@@ -22,8 +22,9 @@ There are four modes:
 - `once` makes one call: correctness checks, and cold-cache timing.
 - `race` makes calls until `<seconds>` have passed; this mode is used when the
   runner changes the tree underneath.
-- `time` makes calls for `<warmup>` seconds unmeasured, then for `<seconds>`
-  measured; this mode is used for benchmarking.
+- `time` makes passes through a list of requests: `<warmup-passes>` passes
+  unmeasured, then `<passes>` passes measured; this mode is used for
+  benchmarking.
 
 Arguments:
 
@@ -41,17 +42,57 @@ Arguments:
   pass through symlinks or contain `.`, `..` and `//`, as real configurations
   do. Before the first call, the driver prepares whatever the strategy keeps
   (a root descriptor, a string).
-- `<path>` is the request, raw bytes, handed to the strategy unchanged. It is
-  always the last argument and never parsed as an option, so it may be empty,
-  begin with `-`, or be absolute.
-- `<seconds>` and `<warmup>` are decimal, and may have a fractional part. Both
-  are in seconds.
+- `<path>` (in `once` and `race`) is the request, raw bytes, handed to the
+  strategy unchanged. It is always the last argument and never parsed as an
+  option, so it may be empty, begin with `-`, or be absolute. The requests in
+  a `time` file are handed over the same way.
+- `<seconds>` is decimal, and may have a fractional part.
+- `<requests>` names a file of requests, each one raw bytes followed by a NUL
+  byte. A request may be empty or hold any byte but NUL; the file has one NUL
+  per request, ends with a NUL, and holds at least one request. The driver
+  reads the whole file before the first call, and makes one call per request
+  in each pass.
+- `<warmup-passes>` and `<passes>` are decimal integers; `<passes>` is at
+  least 1. `<seed>` is a decimal integer from 0 to 2^64 - 1.
 
 ## A single call
 
 The strategy does just one `op` request per _call_: resolve `<path>` under the
 root, open it with the `op`'s flags, and close the descriptor. In `once` mode
-the driver makes one call; the `race` and `time` modes repeat the same call.
+the driver makes one call, and the `race` mode repeats it. The `time` mode
+makes one call for each request in its file, once per pass.
+
+## The order of requests in `time`
+
+Every driver makes the same calls in the same order for the same `<seed>`, so
+runs in different languages see the same sequence. The driver shuffles its
+list of requests at the start of every pass, warm-up passes included, with one
+generator that starts from `<seed>` and is never reset. The first pass is a
+shuffle too: the order in the file doesn't matter.
+
+The generator is splitmix64. Its `state` is 64 bits, and starts as `<seed>`.
+Each call to `next` does this, with arithmetic modulo 2^64:
+
+```
+state += 0x9E3779B97F4A7C15
+z = state
+z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+return z ^ (z >> 31)
+```
+
+The shuffle is Fisher-Yates, over the `n` requests as they stand after the
+previous pass:
+
+```
+for i from n - 1 down to 1:
+    j = next() mod (i + 1)
+    swap requests i and j
+```
+
+The modulo makes some `j` slightly likelier than others, by less than one part
+in 10^12 for any list under a million requests. The timed region is the calls
+alone: shuffling happens between calls.
 
 In `once` and `race` modes the driver also runs `fstat` on the descriptor
 before closing it, to identify the file reached. `time` mode skips the
@@ -68,7 +109,7 @@ OUTCOME <count> ok <dev> <ino>
 OUTCOME <count> ok
 OUTCOME <count> error <label>
 TIME <nanoseconds>
-HIST <lower> <count>
+HIST <outcome> <lower> <count>
 ```
 
 - One `OUTCOME` line per distinct outcome. The counts add up to the number of
@@ -93,9 +134,13 @@ HIST <lower> <count>
 - `TIME` (from `once` and `time`) is the total time of the measured calls, in
   nanoseconds, measured by the driver around the calls alone. The arithmetic
   mean is `TIME` divided by the `OUTCOME` counts' sum.
-- `HIST` (from `time` only) describes the distribution: `time` reads the clock
-  around every call, and prints one line per nonempty bucket, in increasing
-  order of `<lower>`. `<count>` is the number of calls in that bucket.
+- `HIST` (from `time` only) describes the distribution of each outcome's
+  calls: `time` reads the clock around every call, and prints one line per
+  nonempty bucket of each outcome. `<outcome>` is the index, from 0, of an
+  `OUTCOME` line in the order printed, and `<count>` is the number of that
+  outcome's calls in the bucket. Lines come in increasing order of
+  `<outcome>`, then of `<lower>`, and each outcome's counts add up to its
+  `OUTCOME` count.
   + Buckets are fixed by the protocol, so histograms from any driver can be
     compared and merged. Below 16 ns each bucket is 1 ns wide; within
     `[2^k, 2^(k+1))` for k >= 4 each is `2^(k-4)` ns wide, 16 to a power of

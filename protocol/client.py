@@ -8,11 +8,13 @@ and any exit status but 0, is a driver failure, never an outcome.
 from __future__ import annotations
 
 import errno
+import os
 import re
 import subprocess
 import sys
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from pathlib import Path
 from typing import cast
 
@@ -110,6 +112,7 @@ class Outcome:
     dev: int | None = None  # set for ok outcomes from once and race, which fstat the file
     ino: int | None = None
     label: str | None = None  # error, normalized (see normalize_label)
+    hist: tuple[tuple[int, int], ...] = ()  # from time: (bucket lower bound, count)
 
     @property
     def identity(self) -> tuple[int, int] | None:
@@ -123,7 +126,6 @@ class Run:
     failure: str | None = None  # e.g. "timeout", "exit status 2", "bad output: ..."
     outcomes: tuple[Outcome, ...] = ()
     time_ns: int | None = None
-    hist: tuple[tuple[int, int], ...] = ()  # (bucket lower bound, count)
     stderr: str = field(default="", compare=False)
 
 
@@ -149,7 +151,7 @@ _OK_ID = re.compile(rf"OUTCOME {_NUM} ok {_NUM} {_NUM}")
 _OK = re.compile(rf"OUTCOME {_NUM} ok")
 _ERROR = re.compile(rf"OUTCOME {_NUM} error (\S+)")
 _TIME = re.compile(rf"TIME {_NUM}")
-_HIST = re.compile(rf"HIST {_NUM} {_NUM}")
+_HIST = re.compile(rf"HIST {_NUM} {_NUM} {_NUM}")
 _SEMANTICS = "|".join(SEMANTICS)
 _STRATEGY = re.compile(rf"STRATEGY ([a-z0-9-]+) ({_SEMANTICS})")
 _UNAVAILABLE = re.compile(rf"UNAVAILABLE ([a-z0-9-]+) ({_SEMANTICS}) (.+)")
@@ -159,7 +161,7 @@ def parse_run(stdout: str, mode: str) -> Run:
     """Parse the output of once, race or time. Raise ProtocolError if the
     output breaks the protocol."""
     outcomes: list[Outcome] = []
-    time_ns, hist = None, []
+    time_ns, hist = None, []  # hist: (outcome index, bucket lower bound, count)
     for line in stdout.splitlines():
         if m := _OK_ID.fullmatch(line):
             outcomes.append(Outcome(True, int(m[1]), dev=int(m[2]), ino=int(m[3])))
@@ -170,7 +172,7 @@ def parse_run(stdout: str, mode: str) -> Run:
         elif (m := _TIME.fullmatch(line)) and time_ns is None:
             time_ns = int(m[1])
         elif m := _HIST.fullmatch(line):
-            hist.append((int(m[1]), int(m[2])))
+            hist.append((int(m[1]), int(m[2]), int(m[3])))
         else:
             raise ProtocolError(f"unexpected line {line!r}")
     if not outcomes or any(o.count == 0 for o in outcomes):
@@ -188,9 +190,18 @@ def parse_run(stdout: str, mode: str) -> Run:
         raise ProtocolError(f"{mode}: TIME is {'not ' if mode == 'race' else ''}expected")
     if bool(hist) != (mode == "time"):
         raise ProtocolError(f"{mode}: HIST lines are {'' if mode == 'time' else 'not '}expected")
-    if mode == "time" and sum(c for _, c in hist) != calls:
-        raise ProtocolError("HIST counts do not add up to the OUTCOME counts")
-    return Run(outcomes=tuple(outcomes), time_ns=time_ns, hist=tuple(hist))
+    if mode == "time":
+        if [h[:2] for h in hist] != sorted(set(h[:2] for h in hist)):
+            raise ProtocolError("HIST lines are out of order or repeated")
+        if any(i >= len(outcomes) for i, _, _ in hist):
+            raise ProtocolError("HIST names an outcome that isn't there")
+        outcomes = [
+            replace(o, hist=tuple((lower, c) for j, lower, c in hist if j == i))
+            for i, o in enumerate(outcomes)
+        ]
+        if any(sum(c for _, c in o.hist) != o.count for o in outcomes):
+            raise ProtocolError("an outcome's HIST counts do not add up to its count")
+    return Run(outcomes=tuple(outcomes), time_ns=time_ns)
 
 
 def parse_list(stdout: str) -> list[StrategyInfo]:
@@ -213,12 +224,14 @@ def parse_list(stdout: str) -> list[StrategyInfo]:
 # --- invoking drivers ----------------------------------------------------------
 
 
-def list_strategies(command: tuple[str, ...], timeout: float = 30) -> list[StrategyInfo]:
+def list_strategies(
+    command: tuple[str, ...], timeout: timedelta = timedelta(seconds=30)
+) -> list[StrategyInfo]:
     r = subprocess.run(
         [*absolute(command), "list"],
         capture_output=True,
         text=True,
-        timeout=timeout,
+        timeout=timeout.total_seconds(),
         stdin=subprocess.DEVNULL,
     )
     if r.returncode != 0:
@@ -227,7 +240,7 @@ def list_strategies(command: tuple[str, ...], timeout: float = 30) -> list[Strat
 
 
 def invoke(
-    command: tuple[str, ...], mode: str, args: list[str], *, cwd: Path, timeout: float
+    command: tuple[str, ...], mode: str, args: list[str], *, cwd: Path, timeout: timedelta
 ) -> Run:
     """Run one driver command. Failures and crashes return Run(failure=...)."""
     try:
@@ -235,7 +248,7 @@ def invoke(
             [*absolute(command), mode, *args],
             capture_output=True,
             cwd=cwd,
-            timeout=timeout,
+            timeout=timeout.total_seconds(),
             stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as e:
@@ -249,7 +262,7 @@ def invoke(
         run = parse_run(_text(r.stdout), mode)
     except ProtocolError as e:
         return Run(failure=f"bad output: {e}", stderr=stderr)
-    return Run(outcomes=run.outcomes, time_ns=run.time_ns, hist=run.hist, stderr=stderr)
+    return Run(outcomes=run.outcomes, time_ns=run.time_ns, stderr=stderr)
 
 
 def once(
@@ -260,40 +273,64 @@ def once(
     path: str,
     *,
     cwd: Path,
-    timeout: float,
+    timeout: timedelta,
 ) -> Run:
     return invoke(command, "once", [strategy, op, root, path], cwd=cwd, timeout=timeout)
 
 
 def race(
     command: tuple[str, ...],
-    seconds: float,
+    length: timedelta,
     strategy: str,
     op: Op,
     root: str,  # passed as spelled, as for once
     path: str,
     *,
     cwd: Path,
-    timeout: float,
+    timeout: timedelta,
 ) -> Run:
-    args = [f"{seconds:g}", strategy, op, root, path]
+    args = [f"{length.total_seconds():g}", strategy, op, root, path]
     return invoke(command, "race", args, cwd=cwd, timeout=timeout)
 
 
 def time(
     command: tuple[str, ...],
-    warmup: float,
-    seconds: float,
+    warmup_passes: int,
+    passes: int,
+    seed: int,
     strategy: str,
     op: Op,
     root: str,  # passed as spelled, as for once
-    path: str,
+    requests: Path,  # a file of NUL-terminated requests
     *,
     cwd: Path,
-    timeout: float,
+    timeout: timedelta,
 ) -> Run:
-    args = [f"{warmup:g}", f"{seconds:g}", strategy, op, root, path]
-    return invoke(command, "time", args, cwd=cwd, timeout=timeout)
+    """Run the time mode. A run must make exactly one measured call for each
+    request in each pass, so a run whose outcomes add up to anything else is
+    a driver failure."""
+    args = [str(warmup_passes), str(passes), str(seed), strategy, op, root, str(requests)]
+    run = invoke(command, "time", args, cwd=cwd, timeout=timeout)
+    if run.failure:
+        return run
+    n = requests.read_bytes().count(b"\0")
+    calls = sum(o.count for o in run.outcomes)
+    if calls != passes * n:
+        return Run(
+            failure=f"bad output: {calls} calls, not {passes} × {n} requests = {passes * n}",
+            stderr=run.stderr,
+        )
+    return run
+
+
+def write_requests(path: Path, requests: list[str]) -> None:
+    """Write requests to path in the format the time mode reads: each one's
+    bytes, then a NUL."""
+    if not requests:
+        raise ValueError("a request file needs at least one request")
+    if any("\0" in r for r in requests):
+        raise ValueError("a request can't contain NUL")
+    path.write_bytes(b"".join(os.fsencode(r) + b"\0" for r in requests))
 
 
 def _text(b: bytes | str | None) -> str:

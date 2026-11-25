@@ -4,9 +4,9 @@ judging rules."""
 
 import functools
 import warnings
+from datetime import timedelta
 
 import pytest
-
 from protocol import client
 from runner import check
 from treegen import ns
@@ -26,12 +26,12 @@ def shape_results() -> list[check.Result]:
         FIXTURES,
         None,
         "/dev/shm",
-        timeout=2,
+        timeout=timedelta(seconds=2),
         valgrind=False,
         root_shapes=tuple(check.RootShape),
         # Long enough to catch every weak strategy many times over: the
         # weakest, realpath, escapes about a thousand times a second.
-        race_seconds=0.2,
+        race_length=timedelta(seconds=0.2),
     )
     return [*check.run_all(tasks, jobs=16), *unavailable]
 
@@ -86,10 +86,10 @@ def one_cpu_dir_out_of_root() -> dict[str, check.Result]:
         [fx],
         set(OPENAT2),
         "/dev/shm",
-        timeout=2,
+        timeout=timedelta(seconds=2),
         valgrind=False,
         root_shapes=(check.RootShape.PLAIN,),
-        race_seconds=5,
+        race_length=timedelta(seconds=5),
     )
     return {r.strategy: r for r in check.run_all(tasks, jobs=1)}
 

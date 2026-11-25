@@ -13,14 +13,17 @@ cgroup paths-bench:
 Outside bench mode it refuses to run, unless it is given --unpinned, which
 marks the results as unpinned.
 
-Each run is a fresh driver process in the protocol's time mode: a warm-up
-that isn't measured, then a measured stretch, with every call timed into a
-histogram. The runs happen one at a time, so no two drivers compete for a
-core, its caches, or the directories they all walk. The harness pins itself,
-and so every driver, to one CPU, and leaves that CPU's hyperthread sibling
-idle. It runs the first run of every strategy, then the second of every
-strategy, and so on, so a slow drift in the machine is spread over all the
-strategies instead of landing on one.
+Each run is a fresh driver process in the protocol's time mode. The driver
+goes through the tree's list of requests in passes, shuffled afresh each pass
+from the run's seed: one pass that isn't measured, then enough measured passes
+to make at least --calls calls, each timed into its outcome's histogram. Run
+n of every strategy uses seed n, so the same run of different strategies sees
+the same sequence of requests. The runs happen one at a time, so no two
+drivers compete for a core, its caches, or the directories they all walk. The
+harness pins itself, and so every driver, to one CPU, and leaves that CPU's
+hyperthread sibling idle. It runs the first run of every strategy, then the
+second of every strategy, and so on, so a slow drift in the machine is spread
+over all the strategies instead of landing on one.
 
 The file starts with a header and ends with an end record. A file without
 the end record is from a session that didn't finish."""
@@ -30,23 +33,40 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import TextIO
 
 from harness import system
 from protocol import client
-from treegen.build import build_fixture, working_dir
+from treegen.build import build_fixture, free_name, working_dir
 from treegen.spec import Entry, Expect, Fixture, Request, Tree
 
 RESULTS = client.REPO / "results" / "raw"
 
 # How many times to try a run whose guaranteed frequency keeps changing.
 TRIES = 3
+
+# How many measured calls a run makes, at least: enough that a run's P50 and
+# P99 are stable to within a histogram bucket. Earlier sessions' runs of
+# 50,000 calls already agreed that closely; a sweep over this number should
+# settle it.
+CALLS = 100_000
+WARMUP_PASSES = 1
+
+# A run's timeout allows this long per call, which is far longer than any
+# strategy takes, plus a margin for starting the driver and reading its
+# requests.
+TIMEOUT_PER_CALL = timedelta(milliseconds=1)
+TIMEOUT_MARGIN = timedelta(seconds=30)
+# The timeout of the one call each strategy makes before timing.
+ONCE_TIMEOUT = timedelta(seconds=30)
 
 # Where each target puts its trees. tmpfs keeps everything in memory, and ext4
 # is the main local filesystem on the machine this study runs on.
@@ -166,6 +186,8 @@ class Built:
     cwd: Path
     request: str
     expected: tuple[int, int]  # the device and inode of the file the request must open
+    requests: Path  # the file of requests the time mode goes through
+    n_requests: int
 
 
 def build_trees(cell: Cell, targets: list[str], stack: ExitStack) -> list[Built]:
@@ -178,11 +200,16 @@ def build_trees(cell: Cell, targets: list[str], stack: ExitStack) -> list[Built]
         base.mkdir(parents=True, exist_ok=True)
         sb = stack.enter_context(build_fixture(fx, base))
         st = os.stat(sb.root / fx.request.path)
+        # The request file goes beside the root, so no request can reach it.
+        requests = sb.path / free_name(fx, "requests")
+        paths = [fx.request.path]
+        client.write_requests(requests, paths)
         trees.append(
             Built(
-                target, str(sb.root), working_dir(fx, sb), fx.request.path, (st.st_dev, st.st_ino)
+                target, str(sb.root), working_dir(fx, sb), fx.request.path,
+                (st.st_dev, st.st_ino), requests, len(paths),
             )
-        )
+        )  # fmt: skip
     return trees
 
 
@@ -195,7 +222,7 @@ def check(
     for t in trees:
         for s in strategies:
             run = client.once(
-                driver.command, s.name, "read", t.root, t.request, cwd=t.cwd, timeout=30
+                driver.command, s.name, "read", t.root, t.request, cwd=t.cwd, timeout=ONCE_TIMEOUT
             )
             if run.failure:
                 failed.append(f"{t.target} {s.name}: {run.failure}")
@@ -210,15 +237,17 @@ def bench(
     trees: list[Built],
     cell: Cell,
     runs: int,
-    warmup: float,
-    seconds: float,
+    calls: int,
     cpu: int,
     out: TextIO,
 ) -> None:
-    """Time each strategy on each tree, and write a record for each run. cpu is
-    the CPU the runs are pinned to."""
-    timeout = warmup + seconds + 30
+    """Time each strategy on each tree, and write a record for each run. Each
+    run makes at least calls measured calls. cpu is the CPU the runs are
+    pinned to."""
     for t in trees:
+        passes = max(1, math.ceil(calls / t.n_requests))
+        made = (WARMUP_PASSES + passes) * t.n_requests
+        timeout = made * TIMEOUT_PER_CALL + TIMEOUT_MARGIN
         for n in range(1, runs + 1):
             for s in strategies:
                 # A run during which the firmware changed the CPU's guaranteed
@@ -230,8 +259,8 @@ def bench(
                 while discarded < TRIES:
                     before = conditions(cpu)
                     run = client.time(
-                        driver.command, warmup, seconds, s.name, "read", t.root, t.request,
-                        cwd=t.cwd, timeout=timeout,
+                        driver.command, WARMUP_PASSES, passes, n, s.name, "read", t.root,
+                        t.requests, cwd=t.cwd, timeout=timeout,
                     )  # fmt: skip
                     after = conditions(cpu)
                     if before["base_khz"] == after["base_khz"]:
@@ -255,13 +284,22 @@ def bench(
                         "strategy": s.name,
                         "semantics": s.semantics,
                         "run": n,
+                        "seed": n,
+                        "requests": t.n_requests,
+                        "warmup_passes": WARMUP_PASSES,
+                        "passes": passes,
                         "discarded": discarded,
                         "failure": run.failure,
                         "outcomes": [
-                            {"ok": o.ok, "label": o.label, "count": o.count} for o in run.outcomes
+                            {
+                                "ok": o.ok,
+                                "label": o.label,
+                                "count": o.count,
+                                "hist": [list(b) for b in o.hist],
+                            }
+                            for o in run.outcomes
                         ],
                         "time_ns": run.time_ns,
-                        "hist": [list(b) for b in run.hist],
                         "before": before,
                         "after": after,
                     },
@@ -280,8 +318,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--strategy", action="append", help="time only this strategy (repeatable)")
     p.add_argument("--target", action="append", choices=list(TARGETS), help="(repeatable)")
     p.add_argument("--runs", type=int, default=3, help="runs per strategy and target")
-    p.add_argument("--warmup", type=float, default=0.5, help="unmeasured seconds per run")
-    p.add_argument("--seconds", type=float, default=1.0, help="measured seconds per run")
+    p.add_argument(
+        "--calls",
+        type=int,
+        default=CALLS,
+        help=f"measured calls per run, at least (default {CALLS})",
+    )
     p.add_argument(
         "--out", type=Path, help="results file (default: results/raw/bench-<time>.jsonl)"
     )
@@ -335,15 +377,15 @@ def main(argv: list[str] | None = None) -> None:
                 "unavailable": {s.name: s.unavailable for s in offered if s.unavailable},
                 "options": {
                     "runs": args.runs,
-                    "warmup": args.warmup,
-                    "seconds": args.seconds,
+                    "calls": args.calls,
+                    "warmup_passes": WARMUP_PASSES,
                     "targets": targets,
                     "strategies": [s.name for s in strategies],
                 },
             },
         )
         bench(
-            driver, strategies, trees, BASELINE, args.runs, args.warmup, args.seconds,
+            driver, strategies, trees, BASELINE, args.runs, args.calls,
             pinned_to["cpu"], out,
         )  # fmt: skip
         _write(out, {"kind": "end", "finished": system.utc_now()})

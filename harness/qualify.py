@@ -157,6 +157,19 @@ def problems(records: list[dict]) -> list[str]:
     return found
 
 
+def run_hist(run: dict) -> list[list[int]]:
+    """Return one histogram of a run's successful calls. Each outcome has its
+    own histogram; files written before that have one for the whole run."""
+    if "hist" in run:
+        return run["hist"]
+    counts: dict[int, int] = defaultdict(int)
+    for o in run["outcomes"]:
+        if o["ok"]:
+            for lower, count in o["hist"]:
+                counts[lower] += count
+    return [[lower, counts[lower]] for lower in sorted(counts)]
+
+
 def slowest_ns(hist: list[list[int]]) -> int:
     """Return the top of the slowest call's bucket. The slowest call took at
     most that long."""
@@ -168,7 +181,7 @@ def merged(runs: list[dict]) -> list[list[int]]:
     """Return one histogram of all the calls in runs."""
     counts: dict[int, int] = defaultdict(int)
     for r in runs:
-        for lower, count in r["hist"]:
+        for lower, count in run_hist(r):
             counts[lower] += count
     return [[lower, counts[lower]] for lower in sorted(counts)]
 
@@ -218,7 +231,7 @@ def describe(runs: list[dict], each_run: bool, colored: bool) -> None:
             for i in range(3)
         ]
         for cell in mine:
-            each = [figures(r["hist"]) for r in cells[cell]]
+            each = [figures(run_hist(r)) for r in cells[cell]]
             shown = []
             for i, (value, _) in enumerate(totals[cell]):
                 number = fade(f"{value:6.0f}", colored, value, *bounds[i])
