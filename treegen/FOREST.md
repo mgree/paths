@@ -36,7 +36,8 @@ slot when a level needs one and has none.
   lengths, characters, width, maximum depth, link capacity. With a seed it
   determines exactly one tree.
 - **Forest**: one tree per tree config in `treegen/forest.toml`, plus a
-  shared `outside/` directory, built from one seed. We build 10 forests (10 seeds).
+  shared `outside/` directory, built from one seed. A session builds one
+  forest; a session with another seed draws other names.
 - **Query config**: the shape of one request against a tree: depth, symlink
   hops and where they sit, `..` steps (and how many follow a cousin link),
   last component, failure kind and position, operation (read, newfile or write).
@@ -49,7 +50,7 @@ slot when a level needs one and has none.
   protocol's time mode: one unmeasured pass through the cell's requests, in
   an order shuffled from the run's seed, then enough measured passes for at
   least 100,000 calls (see `protocol/PROTOCOL.md`). Each cell gets 3 runs on
-  each of the 10 forests. Cold-cache cells use a different protocol (drop
+  the session's forest. Cold-cache cells use a different protocol (drop
   caches, time one call, repeat), defined with the harness.
 
 ## Layout
