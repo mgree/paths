@@ -4,9 +4,14 @@
 # sweeps share, such as the baseline itself, is timed once.
 #
 # depth is the number of directories on each request's path, which ends in a
-# target file. working_set names how many distinct entries the requests
-# touch, as a share of the pinned CPU's caches: harness/bench.py's
-# WorkingSet defines the names.
+# target file. working_set names how many distinct entries the requests touch,
+# as a share of the pinned CPU's caches: harness/bench.py's WorkingSet defines
+# the names. names, if given, is one byte length for every name; otherwise
+# names follow the surveyed lengths. fixture names the correctness fixture
+# whose tree has the cell's shape. Every strategy is timed on every cell, and
+# the fixture divides a cell's results: strategies that pass it open the
+# cell's files, and the others fail as the correctness results say, so their
+# times are the time it takes them to fail.
 
 [baseline]
 depth = 16
@@ -14,7 +19,19 @@ working_set = "half-L3"
 
 [[sweep]]
 name = "depth"
-levels = [{ depth = 1 }, { depth = 4 }, { depth = 16 }, { depth = 64 }]
+levels = [
+    { depth = 1 },
+    { depth = 4 },
+    { depth = 16 },
+    { depth = 64 },
+    # Past PATH_MAX: 24 directories and a file, each with a 200-byte name, make
+    # a path of about 5,000 bytes. A strategy that fails over-long-path can't
+    # open it at all, and its times here are how long it takes to fail with
+    # ENAMETOOLONG. Names over 32 bytes are stored
+    # apart from their dentries, so this level touches more cache than
+    # BYTES_PER_DENTRY allows for, somewhere short of the whole L3.
+    { depth = 24, names = 200, fixture = "over-long-path" },
+]
 
 [[sweep]]
 name = "working-set"

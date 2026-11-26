@@ -82,21 +82,19 @@ def quantile(hist: list[list[int]], q: float) -> float:
 
 def base_khz(run: dict) -> int | None:
     """Return the guaranteed frequency a run ran at, in kHz, or None if the
-    file doesn't record it before and after the run, or it changed between
-    the two readings."""
-    before, after = run.get("before") or {}, run.get("after") or {}
-    khz = before.get("base_khz")
-    return khz if khz is not None and khz == after.get("base_khz") else None
+    machine doesn't report it, or it changed between the readings before and
+    after the run."""
+    khz = run["before"]["base_khz"]
+    return khz if khz is not None and khz == run["after"]["base_khz"] else None
 
 
 def throttled_ms(run: dict) -> int | None:
     """Return how many milliseconds the hardware throttled the pinned CPU's
-    core or package while the run went on, or None if the file doesn't record
-    the counters before and after the run."""
-    before, after = run.get("before") or {}, run.get("after") or {}
+    core or package while the run went on, or None if the machine doesn't
+    report the counters."""
     total = 0
     for k in THROTTLE_MS:
-        b, a = before.get(k), after.get(k)
+        b, a = run["before"][k], run["after"][k]
         if b is None or a is None:
             return None
         total += a - b
@@ -104,11 +102,9 @@ def throttled_ms(run: dict) -> int | None:
 
 
 def cell_name(cell: dict) -> str:
-    """Return a cell's settings as a short name, such as "depth 16, half-L3".
-    Cells in files written before the sweeps existed have a depth alone."""
-    if "working_set" in cell:
-        return f"depth {cell['depth']}, {cell['working_set']}"
-    return f"depth {cell['depth']}"
+    """Return a cell's settings as a short name, such as "depth 16, half-L3"."""
+    name = f"depth {cell['depth']}, {cell['working_set']}"
+    return name + (f", {cell['names']}-byte names" if cell["names"] else "")
 
 
 def problems(records: list[dict]) -> list[str]:
@@ -122,14 +118,24 @@ def problems(records: list[dict]) -> list[str]:
         found.append("the session didn't finish: the file has no end record")
     if not header["machine"]["pinned"]:
         found.append("the session ran unpinned, outside bench mode")
+    if header["dirty"]:
+        found.append("the session ran with uncommitted changes, so no commit has its code")
+    check = header["correctness"]
+    if check and (check["commit"] != header["commit"] or check["dirty"]):
+        found.append(
+            f"the strategies were divided by correctness results from commit "
+            f"{(check['commit'] or '?')[:12]}{' with a dirty tree' if check['dirty'] else ''}, "
+            f"not this session's commit with a clean tree ({check['file']})"
+        )
 
     options = header["options"]
     made = defaultdict(set)
     for r in runs:
         made[r["target"], cell_name(r["cell"]), r["strategy"]].add(r["run"])
-    cells = [cell_name(c) for c in header.get("cells", ())] or sorted(
-        {cell_name(r["cell"]) for r in runs}
-    )
+    cells = [cell_name(c) for c in header["cells"]]
+    # The strategies that fail each cell's correctness fixture. Their calls are
+    # expected to fail, so their errors aren't problems.
+    fails = {cell_name(c): c["fails"] for c in header["cells"]}
     for target in options["targets"]:
         for cell in cells:
             for strategy in options["strategies"]:
@@ -149,7 +155,7 @@ def problems(records: list[dict]) -> list[str]:
             found.append(f"{where}: failed: {r['failure']}")
             continue
         errors = [o for o in r["outcomes"] if not o["ok"]]
-        if errors:
+        if errors and r["strategy"] not in fails[cell_name(r["cell"])]:
             found.append(
                 f"{where}: {sum(o['count'] for o in errors)} calls failed "
                 f"({', '.join(o['label'] for o in errors)})"
@@ -170,14 +176,12 @@ def problems(records: list[dict]) -> list[str]:
     return found
 
 
-def run_hist(run: dict) -> list[list[int]]:
-    """Return one histogram of a run's successful calls. Each outcome has its
-    own histogram; files written before that have one for the whole run."""
-    if "hist" in run:
-        return run["hist"]
+def run_hist(run: dict, ok: bool = True) -> list[list[int]]:
+    """Return one histogram of a run's successful calls, or, if ok is false, of
+    its failed ones."""
     counts: dict[int, int] = defaultdict(int)
     for o in run["outcomes"]:
-        if o["ok"]:
+        if o["ok"] == ok:
             for lower, count in o["hist"]:
                 counts[lower] += count
     return [[lower, counts[lower]] for lower in sorted(counts)]
@@ -190,11 +194,12 @@ def slowest_ns(hist: list[list[int]]) -> int:
     return lower + bucket_width(lower)
 
 
-def merged(runs: list[dict]) -> list[list[int]]:
-    """Return one histogram of all the calls in runs."""
+def merged(runs: list[dict], ok: bool = True) -> list[list[int]]:
+    """Return one histogram of all the successful calls in runs, or, if ok is
+    false, of all the failed ones."""
     counts: dict[int, int] = defaultdict(int)
     for r in runs:
-        for lower, count in run_hist(r):
+        for lower, count in run_hist(r, ok):
             counts[lower] += count
     return [[lower, counts[lower]] for lower in sorted(counts)]
 
@@ -221,30 +226,56 @@ def spread(values: list[float], widths: list[int]) -> str:
 
 
 # How a section's heading names each setting of a cell.
-SETTING_NAMES = {"depth": "depth", "working_set": "working set"}
+SETTING_NAMES = {"depth": "depth", "working_set": "working set", "names": "name length"}
 
 
 def setting(key: str, value: object) -> str:
     """Return one setting of a cell as words, such as "depth 16"."""
-    return f"{SETTING_NAMES.get(key, key)} {value}"
+    return f"{SETTING_NAMES[key]} {value}"
 
 
-def print_block(title: str, rows: dict[str, list[dict]], each_run: bool, colored: bool) -> None:
+def print_block(
+    title: str,
+    rows: dict[str, list[dict]],
+    each_run: bool,
+    colored: bool,
+    fails: dict[str, str],
+) -> None:
     """Print a block headed by title, with a line for each strategy in rows:
     the median, 99th percentile and slowest of all its runs' calls, each
     beside how far apart its runs are on it. If colored is true, each figure
     is colored from green to red against the same column's figures in this
     block only. If each_run is true, follow each strategy's line with its runs'
-    own figures."""
+    own figures.
+
+    fails maps each strategy that fails the cell's correctness fixture to why.
+    Those strategies' figures are the time they take to fail, from their failed
+    calls, and they follow the others, apart and uncolored: a time to fail
+    isn't comparable with a time to succeed."""
     print()
     print(paint(title, colored, bold=True))
-    totals = {strategy: figures(merged(group)) for strategy, group in rows.items()}
+    _print_rows({s: g for s, g in rows.items() if s not in fails}, True, each_run, colored)
+    failing = {s: g for s, g in rows.items() if s in fails}
+    if failing:
+        reasons = sorted(set(fails[s] for s in failing))
+        print(
+            paint(f"failing {'; '.join(reasons)}, so these are times to fail:", colored, dim=True)
+        )
+        _print_rows(failing, False, each_run, False)
+
+
+def _print_rows(rows: dict[str, list[dict]], ok: bool, each_run: bool, colored: bool) -> None:
+    """Print a line for each strategy in rows, from its successful calls, or,
+    if ok is false, from its failed ones."""
+    if not rows:
+        return
+    totals = {strategy: figures(merged(group, ok)) for strategy, group in rows.items()}
     bounds = [
         (min(t[i][0] for t in totals.values()), max(t[i][0] for t in totals.values()))
         for i in range(3)
     ]
     for strategy, group in rows.items():
-        each = [figures(run_hist(r)) for r in group]
+        each = [figures(run_hist(r, ok)) for r in group]
         shown = []
         for i, (value, _) in enumerate(totals[strategy]):
             number = fade(f"{value:6.0f}", colored, value, *bounds[i])
@@ -275,41 +306,26 @@ def describe(header: dict, runs: list[dict], each_run: bool, colored: bool) -> N
     heads = " ".join(f"{h:>6} {'':6}" for h in ("p50 ns", "p99 ns", "max ns"))
     print(paint(f"{'strategy':22} {heads}".rstrip(), colored, bold=True))
 
-    cells = header.get("cells", [])
-    if not cells or "sweeps" not in cells[0]:
-        for (target, cell), rows in blocks.items():
-            print_block(f"{target}, {cell}", rows, each_run, colored)
-        return
-
-    keys = [k for k in SETTING_NAMES if k in cells[0]]
-    by_name = {cell_name(c): c for c in cells}
-    sweeps: dict[str, list[dict]] = defaultdict(list)
-    if "sweeps" in header:
-        # The header lists each sweep's cells in the order sweeps.toml does.
-        for name, members in header["sweeps"].items():
-            sweeps[name] = [by_name[cell_name(c)] for c in members]
-    else:
-        # Before it did, sort each sweep's cells by what the sweep varies:
-        # depth by number, and working set by the entries it touches.
-        for c in cells:
-            for name in c["sweeps"]:
-                sweeps[name].append(c)
-        for members in sweeps.values():
-            members.sort(key=lambda c: (c["depth"], c["entries"]))
+    by_name = {cell_name(c): c for c in header["cells"]}
+    # The header lists each sweep's cells in the order sweeps.toml does.
+    sweeps = {
+        name: [by_name[cell_name(c)] for c in members] for name, members in header["sweeps"].items()
+    }
     for name, members in sweeps.items():
-        varied = [k for k in keys if len({c[k] for c in members}) > 1]
-        fixed = [k for k in keys if k not in varied]
-        where = ", ".join(setting(k, members[0][k]) for k in fixed)
+        varied = [k for k in SETTING_NAMES if len({c[k] for c in members}) > 1]
+        fixed = [k for k in SETTING_NAMES if k not in varied]
+        # A setting a cell doesn't set, such as names, is left out of the words.
+        where = ", ".join(setting(k, members[0][k]) for k in fixed if members[0][k] is not None)
         title = f"{name[:1].upper()}{name[1:]} sweep" + (f" ({where})" if where else "")
         print()
         print(paint(title, colored, bold=True))
         for target in targets:
             for c in members:
-                label = ", ".join(setting(k, c[k]) for k in varied) or cell_name(c)
+                label = ", ".join(setting(k, c[k]) for k in varied if c[k] is not None)
                 rows = blocks.get((target, cell_name(c)))
                 if rows:
                     title = f"{target}, {label}, {c['entries']:,} entries"
-                    print_block(title, rows, each_run, colored)
+                    print_block(title, rows, each_run, colored, c["fails"])
 
 
 def main(argv: list[str] | None = None) -> None:

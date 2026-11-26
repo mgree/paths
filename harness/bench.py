@@ -48,7 +48,7 @@ import subprocess
 import sys
 import tomllib
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
@@ -57,8 +57,8 @@ from typing import TextIO
 from harness import system
 from protocol import client
 from treegen import forest
-from treegen.build import build_fixture, free_name, working_dir
-from treegen.spec import Expect, Fixture, Request, Tree
+from treegen.build import DIR_FLAGS, build_fixture, free_name, open_dir, opened, working_dir
+from treegen.spec import Expect, Fixture, Request, Tree, all_fixtures
 
 RESULTS = client.REPO / "results" / "raw"
 
@@ -122,9 +122,18 @@ class Cell:
 
     depth: int
     working_set: WorkingSet
+    # One byte length for every name in the cell's tree, or None for the
+    # surveyed lengths.
+    names: int | None = None
+    # The correctness fixture whose tree has the cell's shape. A strategy that
+    # fails it is left out of the cell, and the results say so.
+    fixture: str | None = None
 
     def __str__(self) -> str:
-        return f"depth {self.depth}, {self.working_set}"
+        parts = [f"depth {self.depth}", str(self.working_set)]
+        if self.names is not None:
+            parts.append(f"{self.names}-byte names")
+        return ", ".join(parts)
 
     def entries(self, caches: dict[str, dict]) -> int:
         """Return how many distinct entries the cell's requests touch, given
@@ -139,11 +148,17 @@ def load_sweeps(path: Path = SWEEPS) -> dict[str, list[Cell]]:
     with path.open("rb") as f:
         data = tomllib.load(f)
     baseline = data["baseline"]
+    fixtures = {fx.name for fx in all_fixtures()}
     sweeps: dict[str, list[Cell]] = {}
     for sweep in data["sweep"]:
         cells = sweeps.setdefault(sweep["name"], [])
         for level in sweep["levels"]:
             settings = {**baseline, **level}
+            unknown = sorted(set(settings) - {f.name for f in fields(Cell)})
+            if unknown:
+                raise SystemExit(f"{path}: unknown settings {', '.join(unknown)}")
+            if settings.get("fixture") not in (None, *fixtures):
+                raise SystemExit(f"{path}: no correctness fixture {settings['fixture']!r}")
             try:
                 working_set = WorkingSet(settings["working_set"])
             except ValueError:
@@ -151,8 +166,63 @@ def load_sweeps(path: Path = SWEEPS) -> dict[str, list[Cell]]:
                 raise SystemExit(
                     f"{path}: unknown working set {settings['working_set']!r} (known: {known})"
                 ) from None
-            cells.append(Cell(settings["depth"], working_set))
+            cells.append(Cell(**{**settings, "working_set": working_set}))
     return sweeps
+
+
+def find_check(commit: str) -> Path | None:
+    """Return the newest correctness results file from commit with a clean
+    tree, or None if there isn't one."""
+    for path in sorted(RESULTS.glob("check-*.jsonl"), reverse=True):
+        with path.open() as f:
+            header = json.loads(f.readline())
+        if header["commit"] == commit and not header["dirty"]:
+            return path
+    return None
+
+
+def read_check(path: Path, driver: str) -> tuple[dict, dict[tuple[str, str], dict]]:
+    """Return a record of the correctness results in path for the header, and
+    each of driver's results there under the plain root shape, by strategy and
+    fixture."""
+    lines = path.read_text().splitlines()
+    header = json.loads(lines[0])
+    record = {
+        "file": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "commit": header["commit"],
+        "dirty": header["dirty"],
+    }
+    results = {}
+    for line in lines[1:]:
+        r = json.loads(line)
+        if r["driver"] == driver and r["root_shape"] == "plain":
+            results[r["strategy"], r["fixture"]] = r
+    return record, results
+
+
+def failing(
+    cells: list[Cell], strategies: list[client.StrategyInfo], results: dict
+) -> dict[Cell, dict[str, str]]:
+    """Return, for each cell, the strategies that fail its correctness fixture,
+    with why. Stop the session if the results don't cover a strategy and a
+    fixture a cell needs."""
+    out: dict[Cell, dict[str, str]] = {}
+    missing = []
+    for c in cells:
+        out[c] = {}
+        if c.fixture is None:
+            continue
+        for s in strategies:
+            r = results.get((s.name, c.fixture))
+            if r is None:
+                missing.append(f"{s.name} on {c.fixture}")
+            # A verdict of "." is a pass: see runner/check.py's Verdict.
+            elif r["verdict"] != ".":
+                out[c][s.name] = f"{c.fixture} ({r['reason']})"
+    if missing:
+        raise SystemExit(f"The correctness results have no verdict for {', '.join(missing)}.")
+    return out
 
 
 def pin_to_one_cpu() -> dict:
@@ -240,17 +310,26 @@ class Built:
     n_requests: int
 
 
+def _stat_beneath(root: Path, path: str) -> os.stat_result:
+    """Return the stat of path under root, walking to it a component at a time,
+    since a path can be longer than PATH_MAX."""
+    head, _, name = path.rpartition("/")
+    with opened(root, DIR_FLAGS) as top, open_dir(top, head) as d:
+        return os.stat(name, dir_fd=d, follow_symlinks=False)
+
+
 def build_trees(
     cells: list[Cell], targets: list[str], caches: dict[str, dict], seed: int, stack: ExitStack
 ) -> tuple[list[Built], dict[Cell, dict]]:
-    """Build a tree for each depth on each target, and write each cell's
-    requests beside it. stack removes the trees when it closes. Return what
-    each cell runs on, and a description of each cell for the header: its
-    tree's shape, and how many entries its requests touch."""
+    """Build a tree for each depth and name length on each target, and write
+    each cell's requests beside it. stack removes the trees when it closes.
+    Return what each cell runs on, and a description of each cell for the
+    header: its tree's shape, and how many entries its requests touch."""
     built, described = [], {}
-    for depth in dict.fromkeys(c.depth for c in cells):
-        mine = [c for c in cells if c.depth == depth]
-        shape = forest.shape_for(depth, max(c.entries(caches) for c in mine))
+    for depth, names in dict.fromkeys((c.depth, c.names) for c in cells):
+        mine = [c for c in cells if (c.depth, c.names) == (depth, names)]
+        lengths = forest.SURVEY if names is None else names
+        shape = forest.shape_for(depth, max(c.entries(caches) for c in mine), lengths)
         tree, files = forest.generate(shape, seed)
         chosen = {}
         for c in mine:
@@ -264,7 +343,7 @@ def build_trees(
                 "requests": len(paths),
             }
         fx = Fixture(
-            name=f"bench-depth{depth}",
+            name=f"bench-depth{depth}" + (f"-names{names}" if names else ""),
             hazard="none",
             about="A benchmark tree: no symlinks, no .., no mounts.",
             root_name="root",
@@ -284,7 +363,7 @@ def build_trees(
                 # The request file goes beside the root, so no request can reach it.
                 requests = sb.path / free_name(fx, f"requests-{c.working_set}")
                 client.write_requests(requests, chosen[c])
-                st = os.stat(sb.root / chosen[c][0])
+                st = _stat_beneath(sb.root, chosen[c][0])
                 built.append(
                     Built(
                         target, c, str(sb.root), cwd, chosen[c][0], (st.st_dev, st.st_ino),
@@ -295,14 +374,16 @@ def build_trees(
 
 
 def check(
-    driver: client.Driver, strategies: list[client.StrategyInfo], built: list[Built]
+    driver: client.Driver,
+    strategies: dict[Cell, list[client.StrategyInfo]],
+    built: list[Built],
 ) -> list[str]:
-    """Make one call with each strategy on each cell and target, using the
-    binary that will be timed. Return a line for each call that didn't open
-    the file."""
+    """Make one call with each of a cell's strategies on each cell and target,
+    using the binary that will be timed. Return a line for each call that
+    didn't open the file."""
     failed = []
     for b in built:
-        for s in strategies:
+        for s in strategies[b.cell]:
             run = client.once(
                 driver.command, s.name, "read", b.root, b.request, cwd=b.cwd, timeout=ONCE_TIMEOUT
             )
@@ -316,22 +397,22 @@ def check(
 
 def bench(
     driver: client.Driver,
-    strategies: list[client.StrategyInfo],
+    strategies: dict[Cell, list[client.StrategyInfo]],
     built: list[Built],
     runs: int,
     calls: int,
     cpu: int,
     out: TextIO,
 ) -> None:
-    """Time each strategy on each cell and target, and write a record for each
-    run. Each run makes at least calls measured calls. cpu is the CPU the runs
-    are pinned to."""
+    """Time each of a cell's strategies on each cell and target, and write a
+    record for each run. Each run makes at least calls measured calls. cpu is
+    the CPU the runs are pinned to."""
     for t in built:
         passes = max(1, math.ceil(calls / t.n_requests))
         made = (WARMUP_PASSES + passes) * t.n_requests
         timeout = made * TIMEOUT_PER_CALL + TIMEOUT_MARGIN
         for n in range(1, runs + 1):
-            for s in strategies:
+            for s in strategies[t.cell]:
                 # A run during which the firmware changed the CPU's guaranteed
                 # frequency mixes two speeds, so it is thrown away and made
                 # again, up to TRIES times.
@@ -403,6 +484,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--runs", type=int, default=3, help="runs per strategy, cell and target")
     p.add_argument("--seed", type=int, default=1, help="the seed the trees are built from")
     p.add_argument("--sweeps", type=Path, default=SWEEPS, help="the sweeps to time")
+    p.add_argument("--driver", default="c", help="the driver to time (default: c)")
+    p.add_argument(
+        "--check",
+        type=Path,
+        help="correctness results that say which strategies fail a cell's fixture (default: the newest from this "
+        "commit with a clean tree); a session using results from another commit or a dirty "
+        "tree doesn't qualify",
+    )
     p.add_argument(
         "--calls",
         type=int,
@@ -420,7 +509,10 @@ def main(argv: list[str] | None = None) -> None:
     machine = system.require_bench_mode(args.unpinned)
     pinned_to = pin_to_one_cpu()
 
-    driver = next(d for d in client.load_drivers() if d.name == "c")
+    drivers = {d.name: d for d in client.load_drivers() if d.runs_here()}
+    if args.driver not in drivers:
+        p.error(f"no driver {args.driver!r} runs here (known: {', '.join(sorted(drivers))})")
+    driver = drivers[args.driver]
     if not args.no_build:
         client.build(driver)
     offered = client.list_strategies(driver.command)
@@ -441,14 +533,35 @@ def main(argv: list[str] | None = None) -> None:
             member.setdefault(c, []).append(name)
     cells = list(member)
 
+    # Every strategy is timed on every cell. A cell that names a correctness
+    # fixture divides its strategies by the correctness results for this
+    # commit: those that pass the fixture open the cell's files, and those that
+    # fail it get the outcome the results report, which the session times too.
+    commit = _git("rev-parse", "HEAD")
+    correctness = None
+    fails: dict[Cell, dict[str, str]] = {c: {} for c in cells}
+    if any(c.fixture for c in cells):
+        path = args.check or find_check(commit)
+        if path is None:
+            raise SystemExit(
+                f"There are no correctness results from commit {commit[:12]} with a clean tree, "
+                "so the harness can't tell which strategies fail each cell's fixture. Commit, "
+                "then run 'python -m runner.check', or name a results file with --check."
+            )
+        correctness, results = read_check(path, driver.name)
+        correctness["named"] = args.check is not None
+        fails = failing(cells, strategies, results)
+    passing = {c: [s for s in strategies if s.name not in fails[c]] for c in cells}
+
     stamp = started.replace("-", "").replace(":", "")
     out_path = args.out or RESULTS / f"bench-{stamp}.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
         built, described = build_trees(cells, targets, pinned_to["caches"], args.seed, stack)
-        # Every strategy must open the file on every tree. If one doesn't,
-        # stop before timing anything, and write no results file.
-        failed = check(driver, strategies, built)
+        # Every strategy that passes a cell's fixture must open the file on the
+        # cell's tree. If one doesn't, stop before timing anything, and write
+        # no results file.
+        failed = check(driver, passing, built)
         if failed:
             for line in failed:
                 print(line, file=sys.stderr)
@@ -462,7 +575,7 @@ def main(argv: list[str] | None = None) -> None:
             {
                 "kind": "header",
                 "started": started,
-                "commit": _git("rev-parse", "HEAD"),
+                "commit": commit,
                 "dirty": bool(_git("status", "--porcelain")),
                 "machine": machine,
                 "pinned_to": pinned_to,
@@ -477,12 +590,17 @@ def main(argv: list[str] | None = None) -> None:
                     "seed": args.seed,
                     "bytes_per_dentry": BYTES_PER_DENTRY,
                 },
-                "cells": [{**asdict(c), "sweeps": member[c], **described[c]} for c in cells],
+                "correctness": correctness,
+                "cells": [
+                    {**asdict(c), "sweeps": member[c], **described[c], "fails": fails[c]}
+                    for c in cells
+                ],
                 # Each sweep's cells, in the order sweeps.toml lists them.
                 "sweeps": {name: [asdict(c) for c in cs] for name, cs in sweeps.items()},
             },
         )
-        bench(driver, strategies, built, args.runs, args.calls, pinned_to["cpu"], out)
+        every = {c: strategies for c in cells}
+        bench(driver, every, built, args.runs, args.calls, pinned_to["cpu"], out)
         _write(out, {"kind": "end", "finished": system.utc_now()})
     print(out_path)
 
