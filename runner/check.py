@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Literal
 
 from common import color
+from common.text import plural
 from protocol import client
 from treegen import ns
 from treegen.build import (
@@ -725,9 +726,11 @@ def report(results: list[Result], colored: bool) -> str:
         lines.append(row(f"  {f}", op[f], ms, [m.style for m in ms]))
     rest = len(fixtures) - len(shown) - len(skipped)
     if rest:
-        lines.append(f"{rest} other fixtures pass under every strategy")
+        verb = "passes" if rest == 1 else "pass"
+        lines.append(f"{plural(rest, 'other fixture')} {verb} under every strategy")
     if skipped:
-        lines.append(f"{len(skipped)} fixtures are skipped under every strategy")
+        verb = "is" if len(skipped) == 1 else "are"
+        lines.append(f"{plural(len(skipped), 'fixture')} {verb} skipped under every strategy")
     passed = [sum(cell.get((f, c)) == Verdict.PASSED for f in fixtures) for c in columns]
     # Color each count by the share of its fixtures the strategy passed: the
     # best share in the row is green and the worst is red.
@@ -869,7 +872,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"\nresults: {out}")
     broken = driver_failures(results)
     if broken:
-        print(f"\n{len(broken)} driver failure(s), bugs in the driver or a strategy:")
+        print(f"\n{plural(len(broken), 'driver failure')}, bugs in the driver or a strategy:")
         for r in broken:
             assert r.attempt is not None
             print(f"  {r.driver}/{r.strategy} on {r.fixture}: {r.attempt.failure}")

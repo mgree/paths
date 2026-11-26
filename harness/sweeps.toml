@@ -1,0 +1,25 @@
+# The benchmark's one-axis sweeps. Each sweep changes one setting of the
+# baseline cell and keeps the others fixed, so the cells a session times are
+# the baseline with each sweep's levels applied in turn. A cell that two
+# sweeps share, such as the baseline itself, is timed once.
+#
+# depth is the number of directories on each request's path, which ends in a
+# target file. working_set names how many distinct entries the requests
+# touch, as a share of the pinned CPU's caches: harness/bench.py's
+# WorkingSet defines the names.
+
+[baseline]
+depth = 16
+working_set = "half-L3"
+
+[[sweep]]
+name = "depth"
+levels = [{ depth = 1 }, { depth = 4 }, { depth = 16 }, { depth = 64 }]
+
+[[sweep]]
+name = "working-set"
+levels = [
+    { working_set = "half-L2" },
+    { working_set = "half-L3" },
+    { working_set = "twice-L3" },
+]

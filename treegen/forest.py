@@ -71,6 +71,32 @@ class Shape:
         return total + self.leaves
 
 
+# How many directories each branching level holds. 6 is the median number of
+# entries per directory in the Linux 7.3.4 survey (tools/namesurvey.py),
+# counting files too: real directories have far fewer subdirectories than
+# that, since only about 6% of their entries are directories.
+FANOUT = 6
+
+
+def shape_for(depth: int, entries: int, names: str | int = SURVEY) -> Shape:
+    """Return the smallest shape of depth that branches near its root and has
+    at least entries entries. Levels branch FANOUT ways from the root down,
+    the last branching level only as far as it needs to, and the rest don't
+    branch. If FANOUT at every level isn't enough, the deepest level is as
+    wide as it needs to be."""
+    fanout = [1] * depth
+    if Shape(tuple(fanout), names).entries >= entries:
+        return Shape(tuple(fanout), names)
+    for k in range(depth):
+        for f in range(2, FANOUT + 1):
+            fanout[k] = f
+            if Shape(tuple(fanout), names).entries >= entries:
+                return Shape(tuple(fanout), names)
+    while Shape(tuple(fanout), names).entries < entries:
+        fanout[-1] += 1
+    return Shape(tuple(fanout), names)
+
+
 def generate(shape: Shape, seed: int) -> tuple[Tree, list[str]]:
     """Return the tree that shape and seed determine, and the path of each of
     its target files, in the order they were drawn."""

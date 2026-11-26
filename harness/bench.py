@@ -1,7 +1,9 @@
-"""This module times every strategy on one benchmark cell, and writes the
-results to a JSONL file. One invocation is a session, and writes one file. A
-session makes several runs of each strategy on each target, and each run is
-one driver process.
+"""This module times every strategy on the cells of the benchmark's sweeps, and
+writes the results to a JSONL file. One invocation is a session, and writes
+one file. sweeps.toml lists the sweeps: each changes one setting of a baseline
+cell, the depth of the requests or their working set. A session makes several
+runs of each strategy on each cell and target, and each run is one driver
+process.
 
 Run it inside bench mode, so that it and every driver it starts are in the
 cgroup paths-bench:
@@ -25,6 +27,13 @@ hyperthread sibling idle. It runs the first run of every strategy, then the
 second of every strategy, and so on, so a slow drift in the machine is spread
 over all the strategies instead of landing on one.
 
+Before timing anything, the session builds one tree for each depth on each
+target, from treegen.forest and the session's seed, sized for the largest
+working set any cell of that depth needs. Each cell's requests are a random
+subset of its tree's paths, enough to touch the cell's working set: its
+share of the pinned CPU's caches, at BYTES_PER_DENTRY each. The paths have no
+symlinks and no .., and the session removes the trees when it ends.
+
 The file starts with a header and ends with an end record. A file without
 the end record is from a session that didn't finish."""
 
@@ -37,16 +46,19 @@ import math
 import os
 import subprocess
 import sys
+import tomllib
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import timedelta
+from enum import StrEnum
 from pathlib import Path
 from typing import TextIO
 
 from harness import system
 from protocol import client
+from treegen import forest
 from treegen.build import build_fixture, free_name, working_dir
-from treegen.spec import Entry, Expect, Fixture, Request, Tree
+from treegen.spec import Expect, Fixture, Request, Tree
 
 RESULTS = client.REPO / "results" / "raw"
 
@@ -76,36 +88,71 @@ TARGETS = {
 }
 
 
+SWEEPS = Path(__file__).with_name("sweeps.toml")
+
+
+class WorkingSet(StrEnum):
+    """How many distinct entries a cell's requests touch, as a multiple of one
+    of the pinned CPU's caches. sweeps.toml names them by their values."""
+
+    cache: str
+    times: float
+
+    def __new__(cls, name: str, cache: str, times: float) -> WorkingSet:
+        member = str.__new__(cls, name)
+        member._value_ = name
+        member.cache = cache
+        member.times = times
+        return member
+
+    HALF_L2 = ("half-L2", "L2", 0.5)
+    HALF_L3 = ("half-L3", "L3", 0.5)
+    TWICE_L3 = ("twice-L3", "L3", 2.0)
+
+
+# About how much cache one lookup's step through an entry uses: its hash
+# bucket, its dentry and its inode, about four cache lines.
+BYTES_PER_DENTRY = 256
+
+
 @dataclass(frozen=True)
 class Cell:
-    """The settings one benchmark cell holds fixed. Each one-axis sweep in the
-    design changes one of these."""
+    """The settings one benchmark cell holds fixed. Each sweep in sweeps.toml
+    changes one of them."""
 
-    depth: int = 16
-    tree: str = "fixed"  # which tree: "fixed" until the forest generator exists
+    depth: int
+    working_set: WorkingSet
 
-    def fixture(self) -> Fixture:
-        """Return the cell's tree as a treegen fixture: a chain of directories
-        ending in a file, with a read request that must open the file."""
-        path = "/".join([f"dir{i:02}" for i in range(1, self.depth + 1)] + ["file"])
-        root = Tree()
-        root.add(Entry(path, "file"))
-        reaches = (Expect("ok", file=path),)
-        return Fixture(
-            name=f"bench-{self.tree}-depth{self.depth}",
-            hazard="none",
-            about="The baseline benchmark tree: no symlinks, no .., no mounts.",
-            root_name="root",
-            requires=(),
-            root=root,
-            outside=Tree(),
-            request=Request("read", path),
-            expect=reaches,
-            expect_in_root=reaches,
-        )
+    def __str__(self) -> str:
+        return f"depth {self.depth}, {self.working_set}"
+
+    def entries(self, caches: dict[str, dict]) -> int:
+        """Return how many distinct entries the cell's requests touch, given
+        the pinned CPU's caches."""
+        ws = self.working_set
+        return int(caches[ws.cache]["bytes"] * ws.times / BYTES_PER_DENTRY)
 
 
-BASELINE = Cell()
+def load_sweeps(path: Path = SWEEPS) -> dict[str, list[Cell]]:
+    """Return each sweep in path by name, with its cells in the order path
+    lists them. A cell can belong to several sweeps."""
+    with path.open("rb") as f:
+        data = tomllib.load(f)
+    baseline = data["baseline"]
+    sweeps: dict[str, list[Cell]] = {}
+    for sweep in data["sweep"]:
+        cells = sweeps.setdefault(sweep["name"], [])
+        for level in sweep["levels"]:
+            settings = {**baseline, **level}
+            try:
+                working_set = WorkingSet(settings["working_set"])
+            except ValueError:
+                known = ", ".join(WorkingSet)
+                raise SystemExit(
+                    f"{path}: unknown working set {settings['working_set']!r} (known: {known})"
+                ) from None
+            cells.append(Cell(settings["depth"], working_set))
+    return sweeps
 
 
 def pin_to_one_cpu() -> dict:
@@ -180,72 +227,106 @@ def _write(out: TextIO, record: dict) -> None:
 
 @dataclass(frozen=True)
 class Built:
-    """A cell's tree, built on one target, as the driver is given it."""
+    """One cell on one target: its tree, as the driver is given it, and its
+    requests."""
 
     target: str
+    cell: Cell
     root: str
     cwd: Path
-    request: str
-    expected: tuple[int, int]  # the device and inode of the file the request must open
+    request: str  # the request the check before timing makes
+    expected: tuple[int, int]  # the device and inode of the file it must open
     requests: Path  # the file of requests the time mode goes through
     n_requests: int
 
 
-def build_trees(cell: Cell, targets: list[str], stack: ExitStack) -> list[Built]:
-    """Build the cell's tree on each target. stack removes them when it
-    closes."""
-    trees = []
-    for target in targets:
-        fx = cell.fixture()
-        base = TARGETS[target]
-        base.mkdir(parents=True, exist_ok=True)
-        sb = stack.enter_context(build_fixture(fx, base))
-        st = os.stat(sb.root / fx.request.path)
-        # The request file goes beside the root, so no request can reach it.
-        requests = sb.path / free_name(fx, "requests")
-        paths = [fx.request.path]
-        client.write_requests(requests, paths)
-        trees.append(
-            Built(
-                target, str(sb.root), working_dir(fx, sb), fx.request.path,
-                (st.st_dev, st.st_ino), requests, len(paths),
-            )
-        )  # fmt: skip
-    return trees
+def build_trees(
+    cells: list[Cell], targets: list[str], caches: dict[str, dict], seed: int, stack: ExitStack
+) -> tuple[list[Built], dict[Cell, dict]]:
+    """Build a tree for each depth on each target, and write each cell's
+    requests beside it. stack removes the trees when it closes. Return what
+    each cell runs on, and a description of each cell for the header: its
+    tree's shape, and how many entries its requests touch."""
+    built, described = [], {}
+    for depth in dict.fromkeys(c.depth for c in cells):
+        mine = [c for c in cells if c.depth == depth]
+        shape = forest.shape_for(depth, max(c.entries(caches) for c in mine))
+        tree, files = forest.generate(shape, seed)
+        chosen = {}
+        for c in mine:
+            paths, touched = forest.working_set(files, c.entries(caches), seed)
+            chosen[c] = paths
+            described[c] = {
+                "fanout": list(shape.fanout),
+                "tree_entries": shape.entries,
+                "entries_wanted": c.entries(caches),
+                "entries": touched,
+                "requests": len(paths),
+            }
+        fx = Fixture(
+            name=f"bench-depth{depth}",
+            hazard="none",
+            about="A benchmark tree: no symlinks, no .., no mounts.",
+            root_name="root",
+            requires=(),
+            root=tree,
+            outside=Tree(),
+            request=Request("read", files[0]),
+            expect=(Expect("ok", file=files[0]),),
+            expect_in_root=(Expect("ok", file=files[0]),),
+        )
+        for target in targets:
+            base = TARGETS[target]
+            base.mkdir(parents=True, exist_ok=True)
+            sb = stack.enter_context(build_fixture(fx, base))
+            cwd = working_dir(fx, sb)
+            for c in mine:
+                # The request file goes beside the root, so no request can reach it.
+                requests = sb.path / free_name(fx, f"requests-{c.working_set}")
+                client.write_requests(requests, chosen[c])
+                st = os.stat(sb.root / chosen[c][0])
+                built.append(
+                    Built(
+                        target, c, str(sb.root), cwd, chosen[c][0], (st.st_dev, st.st_ino),
+                        requests, len(chosen[c]),
+                    )
+                )  # fmt: skip
+    return built, described
 
 
 def check(
-    driver: client.Driver, strategies: list[client.StrategyInfo], trees: list[Built]
+    driver: client.Driver, strategies: list[client.StrategyInfo], built: list[Built]
 ) -> list[str]:
-    """Make one call with each strategy on each tree, using the binary that
-    will be timed. Return a line for each call that didn't open the file."""
+    """Make one call with each strategy on each cell and target, using the
+    binary that will be timed. Return a line for each call that didn't open
+    the file."""
     failed = []
-    for t in trees:
+    for b in built:
         for s in strategies:
             run = client.once(
-                driver.command, s.name, "read", t.root, t.request, cwd=t.cwd, timeout=ONCE_TIMEOUT
+                driver.command, s.name, "read", b.root, b.request, cwd=b.cwd, timeout=ONCE_TIMEOUT
             )
+            where = f"{b.target} {b.cell} {s.name}"
             if run.failure:
-                failed.append(f"{t.target} {s.name}: {run.failure}")
-            elif [(o.ok, o.dev, o.ino) for o in run.outcomes] != [(True, *t.expected)]:
-                failed.append(f"{t.target} {s.name}: reached {run.outcomes}, not {t.expected}")
+                failed.append(f"{where}: {run.failure}")
+            elif [(o.ok, o.dev, o.ino) for o in run.outcomes] != [(True, *b.expected)]:
+                failed.append(f"{where}: reached {run.outcomes}, not {b.expected}")
     return failed
 
 
 def bench(
     driver: client.Driver,
     strategies: list[client.StrategyInfo],
-    trees: list[Built],
-    cell: Cell,
+    built: list[Built],
     runs: int,
     calls: int,
     cpu: int,
     out: TextIO,
 ) -> None:
-    """Time each strategy on each tree, and write a record for each run. Each
-    run makes at least calls measured calls. cpu is the CPU the runs are
-    pinned to."""
-    for t in trees:
+    """Time each strategy on each cell and target, and write a record for each
+    run. Each run makes at least calls measured calls. cpu is the CPU the runs
+    are pinned to."""
+    for t in built:
         passes = max(1, math.ceil(calls / t.n_requests))
         made = (WARMUP_PASSES + passes) * t.n_requests
         timeout = made * TIMEOUT_PER_CALL + TIMEOUT_MARGIN
@@ -268,7 +349,7 @@ def bench(
                         break
                     discarded += 1
                     print(
-                        f"{t.target} run {n} {s.name}: guaranteed frequency changed from "
+                        f"{t.target} {t.cell} run {n} {s.name}: guaranteed frequency changed from "
                         f"{before['base_khz']} to {after['base_khz']} kHz; running it again",
                         file=sys.stderr,
                     )
@@ -281,7 +362,7 @@ def bench(
                     {
                         "kind": "run",
                         "target": t.target,
-                        "cell": asdict(cell),
+                        "cell": asdict(t.cell),
                         "strategy": s.name,
                         "semantics": s.semantics,
                         "run": n,
@@ -305,20 +386,23 @@ def bench(
                         "after": after,
                     },
                 )
-                calls = sum(o.count for o in run.outcomes)
-                mean = f"{run.time_ns / calls:.0f} ns mean" if calls and run.time_ns else ""
+                made = sum(o.count for o in run.outcomes)
+                mean = f"{run.time_ns / made:.0f} ns mean" if made and run.time_ns else ""
                 print(
-                    f"{t.target} run {n} {s.name}: {run.failure or f'{calls} calls, {mean}'}",
+                    f"{t.target} {t.cell} run {n} {s.name}: "
+                    f"{run.failure or f'{made} calls, {mean}'}",
                     file=sys.stderr,
                 )
 
 
 def main(argv: list[str] | None = None) -> None:
-    p = argparse.ArgumentParser(description="Time every strategy on one benchmark cell.")
+    p = argparse.ArgumentParser(description="Time every strategy on the benchmark's sweeps.")
     p.add_argument("--unpinned", action="store_true", help="run outside bench mode")
     p.add_argument("--strategy", action="append", help="time only this strategy (repeatable)")
     p.add_argument("--target", action="append", choices=list(TARGETS), help="(repeatable)")
-    p.add_argument("--runs", type=int, default=3, help="runs per strategy and target")
+    p.add_argument("--runs", type=int, default=3, help="runs per strategy, cell and target")
+    p.add_argument("--seed", type=int, default=1, help="the seed the trees are built from")
+    p.add_argument("--sweeps", type=Path, default=SWEEPS, help="the sweeps to time")
     p.add_argument(
         "--calls",
         type=int,
@@ -348,15 +432,23 @@ def main(argv: list[str] | None = None) -> None:
         s for s in offered if not s.unavailable and (not args.strategy or s.name in args.strategy)
     ]
     targets = args.target or list(TARGETS)
+    sweeps = load_sweeps(args.sweeps)
+    # Every cell once, in the order the sweeps first list it, with the sweeps
+    # it belongs to.
+    member: dict[Cell, list[str]] = {}
+    for name, sweep_cells in sweeps.items():
+        for c in sweep_cells:
+            member.setdefault(c, []).append(name)
+    cells = list(member)
 
     stamp = started.replace("-", "").replace(":", "")
     out_path = args.out or RESULTS / f"bench-{stamp}.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with ExitStack() as stack:
-        trees = build_trees(BASELINE, targets, stack)
+        built, described = build_trees(cells, targets, pinned_to["caches"], args.seed, stack)
         # Every strategy must open the file on every tree. If one doesn't,
         # stop before timing anything, and write no results file.
-        failed = check(driver, strategies, trees)
+        failed = check(driver, strategies, built)
         if failed:
             for line in failed:
                 print(line, file=sys.stderr)
@@ -382,13 +474,15 @@ def main(argv: list[str] | None = None) -> None:
                     "warmup_passes": WARMUP_PASSES,
                     "targets": targets,
                     "strategies": [s.name for s in strategies],
+                    "seed": args.seed,
+                    "bytes_per_dentry": BYTES_PER_DENTRY,
                 },
+                "cells": [{**asdict(c), "sweeps": member[c], **described[c]} for c in cells],
+                # Each sweep's cells, in the order sweeps.toml lists them.
+                "sweeps": {name: [asdict(c) for c in cs] for name, cs in sweeps.items()},
             },
         )
-        bench(
-            driver, strategies, trees, BASELINE, args.runs, args.calls,
-            pinned_to["cpu"], out,
-        )  # fmt: skip
+        bench(driver, strategies, built, args.runs, args.calls, pinned_to["cpu"], out)
         _write(out, {"kind": "end", "finished": system.utc_now()})
     print(out_path)
 

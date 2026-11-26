@@ -8,7 +8,7 @@ random. A test's id names its seed, so a failure can be rerun with it."""
 import random
 
 import pytest
-from treegen.forest import Shape, dentries_of, generate, working_set
+from treegen.forest import FANOUT, Shape, dentries_of, generate, shape_for, working_set
 from treegen.spec import SpecError
 
 SHAPES = [
@@ -57,3 +57,20 @@ def test_a_tree_too_small_for_the_working_set_is_refused():
     _, files = generate(shape, 1)
     with pytest.raises(SpecError, match="fewer than"):
         working_set(files, shape.entries + 1, 1)
+
+
+@pytest.mark.parametrize("depth", [1, 4, 16, 64])
+@pytest.mark.parametrize("entries", [1, 37, 5_000, 150_000])
+def test_shape_for_is_big_enough_and_branches_near_the_root(depth, entries):
+    shape = shape_for(depth, entries)
+    assert shape.depth == depth and shape.entries >= entries
+    # Levels that branch come first, and only the deepest of them is either
+    # narrower than FANOUT or, when nothing else is enough, wider.
+    branching = [f for f in shape.fanout if f > 1]
+    assert shape.fanout[: len(branching)] == tuple(branching)
+    assert all(f == FANOUT for f in branching[:-1])
+    # One fewer at the last branching level would be too small.
+    if branching:
+        k = len(branching) - 1
+        narrower = shape.fanout[:k] + (shape.fanout[k] - 1,) + shape.fanout[k + 1 :]
+        assert Shape(narrower).entries < entries

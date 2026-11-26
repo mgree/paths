@@ -54,6 +54,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from common.color import RED, fade, paint, use_color
+from common.text import plural
 
 THROTTLE_MS = ("core_throttle_ms", "package_throttle_ms")
 
@@ -102,6 +103,14 @@ def throttled_ms(run: dict) -> int | None:
     return total
 
 
+def cell_name(cell: dict) -> str:
+    """Return a cell's settings as a short name, such as "depth 16, half-L3".
+    Cells in files written before the sweeps existed have a depth alone."""
+    if "working_set" in cell:
+        return f"depth {cell['depth']}, {cell['working_set']}"
+    return f"depth {cell['depth']}"
+
+
 def problems(records: list[dict]) -> list[str]:
     """Return every reason the session can't be used. The session qualifies
     if there are none."""
@@ -117,21 +126,25 @@ def problems(records: list[dict]) -> list[str]:
     options = header["options"]
     made = defaultdict(set)
     for r in runs:
-        made[r["target"], r["strategy"]].add(r["run"])
+        made[r["target"], cell_name(r["cell"]), r["strategy"]].add(r["run"])
+    cells = [cell_name(c) for c in header.get("cells", ())] or sorted(
+        {cell_name(r["cell"]) for r in runs}
+    )
     for target in options["targets"]:
-        for strategy in options["strategies"]:
-            missing = set(range(1, options["runs"] + 1)) - made[target, strategy]
-            if missing:
-                numbers = ", ".join(map(str, sorted(missing)))
-                found.append(
-                    f"{target} {strategy}: run {numbers} is missing"
-                    if len(missing) == 1
-                    else f"{target} {strategy}: runs {numbers} are missing"
-                )
+        for cell in cells:
+            for strategy in options["strategies"]:
+                missing = set(range(1, options["runs"] + 1)) - made[target, cell, strategy]
+                if missing:
+                    numbers = ", ".join(map(str, sorted(missing)))
+                    found.append(
+                        f"{target} {cell} {strategy}: run {numbers} is missing"
+                        if len(missing) == 1
+                        else f"{target} {cell} {strategy}: runs {numbers} are missing"
+                    )
 
     frequencies = set()
     for r in runs:
-        where = f"{r['target']} run {r['run']} {r['strategy']}"
+        where = f"{r['target']} {cell_name(r['cell'])} run {r['run']} {r['strategy']}"
         if r["failure"]:
             found.append(f"{where}: failed: {r['failure']}")
             continue
@@ -207,44 +220,96 @@ def spread(values: list[float], widths: list[int]) -> str:
     return f"±<{half:.0f}" if sd < half else f"±{sd:.0f}"
 
 
-def describe(runs: list[dict], each_run: bool, colored: bool) -> None:
-    """Print a line for each cell: the median, 99th percentile and slowest of
-    all its calls, each beside how far apart its runs are on it. Targets are
-    printed apart, since their times aren't comparable. If colored is true,
-    color each figure from green to red by how it compares with the same
-    column's figures on the same target. If each_run is true, follow each
-    cell's line with its runs' own figures."""
-    cells: dict[tuple[str, str], list[dict]] = defaultdict(list)
+# How a section's heading names each setting of a cell.
+SETTING_NAMES = {"depth": "depth", "working_set": "working set"}
+
+
+def setting(key: str, value: object) -> str:
+    """Return one setting of a cell as words, such as "depth 16"."""
+    return f"{SETTING_NAMES.get(key, key)} {value}"
+
+
+def print_block(title: str, rows: dict[str, list[dict]], each_run: bool, colored: bool) -> None:
+    """Print a block headed by title, with a line for each strategy in rows:
+    the median, 99th percentile and slowest of all its runs' calls, each
+    beside how far apart its runs are on it. If colored is true, each figure
+    is colored from green to red against the same column's figures in this
+    block only. If each_run is true, follow each strategy's line with its runs'
+    own figures."""
+    print()
+    print(paint(title, colored, bold=True))
+    totals = {strategy: figures(merged(group)) for strategy, group in rows.items()}
+    bounds = [
+        (min(t[i][0] for t in totals.values()), max(t[i][0] for t in totals.values()))
+        for i in range(3)
+    ]
+    for strategy, group in rows.items():
+        each = [figures(run_hist(r)) for r in group]
+        shown = []
+        for i, (value, _) in enumerate(totals[strategy]):
+            number = fade(f"{value:6.0f}", colored, value, *bounds[i])
+            sd = spread([e[i][0] for e in each], [e[i][1] for e in each])
+            shown.append(f"{number} {sd:<6}")
+        print(f"{strategy:22} {' '.join(shown)}".rstrip())
+        if each_run:
+            for r, e in zip(group, each, strict=True):
+                values = " ".join(f"{value:6.0f} {'':6}" for value, _ in e).rstrip()
+                print(
+                    f"  run {r['run']:<18} {values}"
+                    + (f"  after {r['discarded']} discarded" if r["discarded"] else "")
+                )
+
+
+def describe(header: dict, runs: list[dict], each_run: bool, colored: bool) -> None:
+    """Print the session's figures sweep by sweep. Each sweep's section is
+    headed by the settings it holds fixed, and has a block for each target and
+    cell in the sweep, headed by the setting it varies and how many entries
+    its requests touch. A cell that two sweeps share appears in both. Times
+    from different targets or cells aren't comparable, so each block is
+    colored on its own. Files without sweeps in their header get one block
+    for each target and cell."""
+    blocks: dict[tuple[str, str], dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
     for r in runs:
-        cells[r["target"], r["strategy"]].append(r)
-    totals = {cell: figures(merged(group)) for cell, group in cells.items()}
+        blocks[r["target"], cell_name(r["cell"])][r["strategy"]].append(r)
+    targets = list(dict.fromkeys(target for target, _ in blocks))
     heads = " ".join(f"{h:>6} {'':6}" for h in ("p50 ns", "p99 ns", "max ns"))
-    head = f"{'target':6} {'strategy':22} {heads}".rstrip()
-    print(paint(head, colored, bold=True))
-    targets = list(dict.fromkeys(target for target, _ in cells))
-    for n, target in enumerate(targets):
-        if n:
-            print()
-        mine = [cell for cell in cells if cell[0] == target]
-        bounds = [
-            (min(totals[c][i][0] for c in mine), max(totals[c][i][0] for c in mine))
-            for i in range(3)
-        ]
-        for cell in mine:
-            each = [figures(run_hist(r)) for r in cells[cell]]
-            shown = []
-            for i, (value, _) in enumerate(totals[cell]):
-                number = fade(f"{value:6.0f}", colored, value, *bounds[i])
-                sd = spread([e[i][0] for e in each], [e[i][1] for e in each])
-                shown.append(f"{number} {sd:<6}")
-            print(f"{target:6} {cell[1]:22} {' '.join(shown)}".rstrip())
-            if each_run:
-                for r, e in zip(cells[cell], each, strict=True):
-                    values = " ".join(f"{value:6.0f} {'':6}" for value, _ in e).rstrip()
-                    print(
-                        f"{'':6}   run {r['run']:<16} {values}"
-                        + (f"  after {r['discarded']} discarded" if r["discarded"] else "")
-                    )
+    print(paint(f"{'strategy':22} {heads}".rstrip(), colored, bold=True))
+
+    cells = header.get("cells", [])
+    if not cells or "sweeps" not in cells[0]:
+        for (target, cell), rows in blocks.items():
+            print_block(f"{target}, {cell}", rows, each_run, colored)
+        return
+
+    keys = [k for k in SETTING_NAMES if k in cells[0]]
+    by_name = {cell_name(c): c for c in cells}
+    sweeps: dict[str, list[dict]] = defaultdict(list)
+    if "sweeps" in header:
+        # The header lists each sweep's cells in the order sweeps.toml does.
+        for name, members in header["sweeps"].items():
+            sweeps[name] = [by_name[cell_name(c)] for c in members]
+    else:
+        # Before it did, sort each sweep's cells by what the sweep varies:
+        # depth by number, and working set by the entries it touches.
+        for c in cells:
+            for name in c["sweeps"]:
+                sweeps[name].append(c)
+        for members in sweeps.values():
+            members.sort(key=lambda c: (c["depth"], c["entries"]))
+    for name, members in sweeps.items():
+        varied = [k for k in keys if len({c[k] for c in members}) > 1]
+        fixed = [k for k in keys if k not in varied]
+        where = ", ".join(setting(k, members[0][k]) for k in fixed)
+        title = f"{name[:1].upper()}{name[1:]} sweep" + (f" ({where})" if where else "")
+        print()
+        print(paint(title, colored, bold=True))
+        for target in targets:
+            for c in members:
+                label = ", ".join(setting(k, c[k]) for k in varied) or cell_name(c)
+                rows = blocks.get((target, cell_name(c)))
+                if rows:
+                    title = f"{target}, {label}, {c['entries']:,} entries"
+                    print_block(title, rows, each_run, colored)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -268,16 +333,20 @@ def main(argv: list[str] | None = None) -> None:
     header = records[0]
     runs = [r for r in records if r["kind"] == "run"]
     mhz = (base_khz(runs[0]) or 0) // 1000
-    cells = len({(r["target"], r["strategy"]) for r in runs})
+    cells = len({cell_name(r["cell"]) for r in runs})
+    targets = len({r["target"] for r in runs})
+    strategies = len({r["strategy"] for r in runs})
     discarded = sum(r["discarded"] for r in runs)
     print(args.results.name)
     print(
-        f"This session qualifies: {mhz} MHz, {header['options']['runs']} runs "
-        f"of {cells} cells, started {header['started']}"
-        + (f", {discarded} tries discarded" if discarded else "")
+        f"This session qualifies: {mhz} MHz, {plural(header['options']['runs'], 'run')} of "
+        f"{plural(strategies, 'strategy', 'strategies')} on {plural(cells, 'cell')} "
+        f"and {plural(targets, 'target')}, "
+        f"started {header['started']}"
+        + (f", {plural(discarded, 'try', 'tries')} discarded" if discarded else "")
     )
     print()
-    describe(runs, args.runs, use_color())
+    describe(header, runs, args.runs, use_color())
 
 
 if __name__ == "__main__":
