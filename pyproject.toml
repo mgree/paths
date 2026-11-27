@@ -20,6 +20,8 @@ dev = [
     "ruff==0.17.5",
     "pyright==1.1.414",
     "pyperf @ git+https://github.com/psf/pyperf.git@5d1ee0dd5aaa825982401c617638a607c865d203",
+    "altair==6.3.0",
+    "vl-convert-python==1.9.0.post1",
 ]
 
 [tool.pytest.ini_options]
@@ -37,7 +39,7 @@ target-version = "py312"
 select = ["E4", "E7", "E9", "F", "B"]
 
 [tool.pyright]
-include = ["common", "treegen", "tools", "protocol", "runner", "harness"]
+include = ["analysis", "common", "treegen", "tools", "protocol", "runner", "harness"]
 pythonVersion = "3.12"
 typeCheckingMode = "standard"
 reportDeprecated = "error"
